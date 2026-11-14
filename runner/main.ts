@@ -5,11 +5,14 @@
 
 import {
   appendFileSync, closeSync, constants, existsSync, fchownSync, fstatSync, mkdirSync, openSync, readFileSync, readSync,
-  rmSync, statSync, writeFileSync, writeSync, chownSync,
+  rmSync, statfsSync, statSync, writeFileSync, writeSync, chownSync,
 } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { claims, saveClaim, releaseClaim, remote, ensureImage, validateWorkers, hasCapacity, type Worker, type Claim } from "./workers.ts";
 
 export type Config = {
+  workers?: Worker[];
   repos: string[];
   label: string;
   /** Wie viele Agent-Läufe gleichzeitig, über alle Phasen und Repos (Prüfung, Bau, Abnahme, Verbesserung) */
@@ -31,12 +34,12 @@ export type Config = {
   /** Verbesserungs-Lauf automatisch alle X Tage (zusätzlich zu `factory-improve`). Standard: aus */
   improve?: { everyDays?: number };
   /** Vorschau pro PR mit Passwortschutz (Nutzer "factory"). Mit domain über HTTPS, sonst http://<host>:<4000+slot> */
-  preview?: { host: string; domain?: string; password: string; max?: number; memory?: string };
+  preview?: { host: string; domain?: string; password: string; bind?: "127.0.0.1" | "::1"; max?: number; memory?: string };
 };
 
 type Comment = { author: { login: string } | null; body: string; createdAt: string };
 type Issue = { number: number; title: string; body: string; url: string; labels: { name: string }[]; comments: Comment[] };
-type Container = { name: string; repo: string; issue: number; phase: Phase; mode: string; running: boolean; startedAt: string; finishedAt: string; exitCode: number };
+type Container = { name: string; repo: string; issue: number; phase: Phase; mode: string; running: boolean; startedAt: string; finishedAt: string; exitCode: number; claim?: Claim; unreachable?: boolean };
 type Phase = "check" | "build" | "accept";
 type Mode = "new" | "answer" | "change-request" | "retry" | "rework";
 
@@ -72,6 +75,9 @@ function log(event: string, data: Record<string, unknown> = {}) {
 
 export function loadConfig(path = CONFIG_PATH): Config {
   const c = JSON.parse(readFileSync(path, "utf8"));
+  if (c.workers) validateWorkers(c.workers);
+  if (c.preview?.bind && c.preview.domain) throw new Error("Tunnel preview cannot use automatic HTTPS/domain");
+  if (c.preview?.bind && !["127.0.0.1", "::1"].includes(c.preview.bind)) throw new Error("Preview bind must be loopback");
   return {
     label: "factory", maxParallel: 2, model: "opus", workflow: "starter-kit", pollSeconds: 60,
     jobTimeoutMinutes: 90, image: "software-factory-job:latest", dataDir: "/var/lib/software-factory",
@@ -281,11 +287,12 @@ const jobDir = (cfg: Config, repo: string, n: number) => join(cfg.dataDir, "jobs
 const scenarioDir = (cfg: Config, repo: string, n: number) => join(cfg.dataDir, "scenarios", `${repo.replace("/", "__")}__${n}`);
 const agentLimits = (cfg: Config) => ["--memory", cfg.containerMemory, "--memory-swap", cfg.containerMemory, "--pids-limit", "4096", "--shm-size", "1g"];
 
-async function listContainers(): Promise<Container[]> {
+async function listContainers(cfg: Config): Promise<Container[]> {
   const names = (await docker(["ps", "-a", "--filter", "label=software-factory=1", "--format", "{{.Names}}"])).split("\n").filter(Boolean);
   const result: Container[] = [];
   for (const name of names) {
     const info = JSON.parse(await docker(["inspect", name]))[0];
+    if (info.Config.Labels["sf.owner"]) continue; // Remote claims are enumerated exactly once below.
     result.push({
       name, repo: info.Config.Labels["sf.repo"], issue: Number(info.Config.Labels["sf.issue"]),
       phase: (info.Config.Labels["sf.phase"] ?? "build") as Phase,
@@ -294,7 +301,39 @@ async function listContainers(): Promise<Container[]> {
       running: info.State.Running, startedAt: info.State.StartedAt, exitCode: info.State.ExitCode,
     });
   }
+  for (const claim of claims(cfg.dataDir)) {
+    try { result.push({ ...await remote(run, claim.worker, "inspect", claim), claim }); }
+    catch {
+      // A persisted claim remains occupied until the assigned host confirms its outcome.
+      result.push({ ...claim, phase: claim.phase as Phase, running: true, finishedAt: "", exitCode: 0, claim, unreachable: true });
+      log("worker:unreachable", { worker: claim.worker.id, repo: claim.repo, issue: claim.issue });
+    }
+  }
   return result;
+}
+
+async function selectWorker(cfg: Config): Promise<Worker | undefined | null> {
+  if (!cfg.workers) return undefined;
+  const current = await listContainers(cfg);
+  for (const w of cfg.workers) {
+    if (w.enabled === false) continue;
+    const occupied = current.filter(c => c.claim ? c.claim.worker.id === w.id : !w.ssh).length;
+    const onHost = current.filter(c => c.claim ? c.claim.worker.host === w.host : cfg.workers!.some(l => !l.ssh && l.host === w.host)).length;
+    if (onHost >= w.hostSlots) continue;
+    try {
+      const capacity = w.ssh ? await remote(run, w, "capacity") : {
+        memoryMiB: Number(readFileSync("/proc/meminfo", "utf8").match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0) / 1024,
+        diskMiB: Number(statfsSync(cfg.dataDir).bavail) * Number(statfsSync(cfg.dataDir).bsize) / 1048576,
+      };
+      if (!w.ssh) {
+        const dockerRoot = (await docker(["info", "--format", "{{.DockerRootDir}}"])).trim();
+        const fs = statfsSync(dockerRoot);
+        capacity.dockerDiskMiB = Number(fs.bavail) * Number(fs.bsize) / 1048576;
+      }
+      if (hasCapacity(w, capacity, occupied)) return w;
+    } catch { log("worker:unavailable", { worker: w.id }); }
+  }
+  return null;
 }
 
 export function buildPrompt(cfg: Config, repo: string, issue: Issue, phase: Phase, mode: Mode, prUrl?: string, extra?: string): string {
@@ -349,6 +388,10 @@ async function imageFor(cfg: Config, repo: string): Promise<string> {
 }
 
 async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mode: Mode, prUrl?: string, extra?: string) {
+  if (claims(cfg.dataDir).some(c => c.repo === repo && c.issue === issue.number)) throw new Error("Existing worker claim");
+  const worker = await selectWorker(cfg);
+  if (worker === null) return false;
+  if (mode === "retry" && ["checking", "working"].includes(stageOf(issue) ?? "") && !(await lostJob(cfg, repo, issue))) return false;
   const name = containerName(repo, issue.number);
   const dir = jobDir(cfg, repo, issue.number);
   mkdirSync(dir, { recursive: true });
@@ -371,11 +414,26 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
 
   const ghToken = (await gh(["auth", "token"])).trim();
   const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
+  if (worker?.ssh) {
+    const image = await imageFor(cfg, repo);
+    const sourceId = (await docker(["image", "inspect", image, "--format", "{{.Id}}"])).trim();
+    const claim: Claim = { worker, name, repo, issue: issue.number, phase, mode, startedAt: new Date().toISOString(), owner: randomUUID(), image };
+    const imageId = await ensureImage(run, worker, image, sourceId);
+    await remote(run, worker, "preflight", { ...claim, imageId });
+    saveClaim(cfg.dataDir, claim);
+    await remote(run, worker, "start", {
+      ...claim, imageId, prompt: readJobFile(join(dir, "prompt.md")), githubToken: ghToken,
+      scenarios: phase === "accept" ? readJobFile(join(scen, "scenarios.md"), 2_000_000) : undefined,
+      limits: [...agentLimits(cfg), "--cpus", String(worker.cpus)], environment: { REPO: repo, ISSUE: issue.number, BRANCH: `factory/${issue.number}`, MODEL: cfg.model, WORKFLOW: cfg.workflow, PHASE: phase },
+    });
+    log("job:started", { repo, issue: issue.number, phase, mode, container: name, worker: worker.id });
+    return true;
+  }
   await docker(["rm", "-f", name]).catch(() => {});
   await docker([
     "run", "-d", "--name", name,
     "--label", "software-factory=1", "--label", `sf.repo=${repo}`, "--label", `sf.issue=${issue.number}`, "--label", `sf.phase=${phase}`, "--label", `sf.mode=${mode}`,
-    ...agentLimits(cfg),
+    ...agentLimits(cfg), ...(worker ? ["--cpus", String(worker.cpus)] : []),
     "-e", `REPO=${repo}`, "-e", `ISSUE=${issue.number}`, "-e", `BRANCH=factory/${issue.number}`,
     "-e", `MODEL=${cfg.model}`, "-e", `WORKFLOW=${cfg.workflow}`, "-e", `PHASE=${phase}`,
     "-e", "GH_TOKEN", "-e", authVar, // Werte kommen aus der Umgebung, nicht aus der Kommandozeile
@@ -383,6 +441,7 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
     await imageFor(cfg, repo),
   ], { GH_TOKEN: ghToken });
   log("job:started", { repo, issue: issue.number, phase, mode, container: name });
+  return true;
 }
 
 /** Nach einem Bau-Lauf: Sind die Pflicht-Checks auf genau dem gepushten Stand grün und ist die Spec unverändert? */
@@ -408,6 +467,16 @@ async function checkBuild(repo: string, issue: number, dir: string, prUrl?: stri
 /** Wertet einen beendeten Container aus und räumt ihn weg. `reason` = Grund, warum der Runner ihn beendet hat. */
 async function finish(cfg: Config, c: Container, reason?: string) {
   const dir = jobDir(cfg, c.repo, c.issue);
+  if (c.claim) {
+    const files = await remote(run, c.claim.worker, "collect", c.claim);
+    for (const [name, content] of Object.entries(files)) {
+      if (!["status.json", "verify.json", "verify.md", "claude.jsonl", "claude.err", "scenarios.md"].includes(name) || typeof content !== "string") throw new Error("Invalid remote result");
+      const target = name === "scenarios.md" ? scenarioDir(cfg, c.repo, c.issue) : dir;
+      mkdirSync(target, { recursive: true });
+      writeJobFile(join(target, name), content);
+    }
+    if (c.phase === "check" && readJobJson(join(dir, "status.json"))?.status === "approved" && !(typeof files["scenarios.md"] === "string" && files["scenarios.md"].trim())) reason = "Prüfung meldet Freigabe ohne Testszenarien.";
+  }
   const status: { status?: string; step?: string; pr?: string; unresolved?: boolean } = readJobJson(join(dir, "status.json")) ?? {};
   let result: any = {};
   const tail = readJobFile(join(dir, "claude.jsonl"), 500_000) ?? "";
@@ -464,7 +533,10 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       (detail ? "Letzte Ausgabe:\n```\n" + detail + "\n```\n\n" : "") +
       `_Schreib einen Kommentar mit einem Hinweis, dann versucht die Factory es erneut._`);
   }
-  await docker(["rm", "-f", c.name]).catch(() => {});
+  if (c.claim) {
+    await remote(run, c.claim.worker, "cleanup", c.claim);
+    releaseClaim(cfg.dataDir, c.claim);
+  } else await docker(["rm", "-f", c.name]).catch(() => {});
 }
 
 // ---------- Vorschau pro Pull Request (optional) ----------
@@ -497,7 +569,7 @@ export function caddyConfig(cfg: Config, slots: number[], hash: string): string 
   // Mit Domain holt Caddy selbst ein Zertifikat (Ports 80 und 443 müssen erreichbar sein). Ohne Domain nur HTTP.
   const global = domain ? `{\n  admin localhost:2019\n}` : `{\n  auto_https off\n  admin localhost:2019\n}`;
   const blocks = slots.map((slot) =>
-    `${domain ? `${domain}:${PREVIEW_PORT(slot)}` : `:${PREVIEW_PORT(slot)}`} {\n  basic_auth {\n    factory ${hash}\n  }\n  reverse_proxy 127.0.0.1:${INTERNAL_PORT(slot)}\n}`);
+    `${domain ? `${domain}:${PREVIEW_PORT(slot)}` : `:${PREVIEW_PORT(slot)}`} {\n${cfg.preview?.bind ? `  bind ${cfg.preview.bind}\n` : ""}  basic_auth {\n    factory ${hash}\n  }\n  reverse_proxy 127.0.0.1:${INTERNAL_PORT(slot)}\n}`);
   if (domain) blocks.unshift(`${domain} {\n  respond "Software Factory: Vorschauen laufen auf eigenen Ports." 200\n}`);
   return `${global}\n\n${blocks.join("\n\n")}\n`;
 }
@@ -661,8 +733,14 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
   // Label entfernt oder Issue geschlossen → laufenden Job stoppen und als beendet erfassen
   for (const c of containers.filter((c) => c.repo === repo && !openNumbers.has(c.issue))) {
     log("job:stopped", { repo, issue: c.issue, reason: "Label entfernt oder Issue geschlossen" });
-    await docker(["kill", c.name]).catch(() => {});
-    await docker(["rm", "-f", c.name]).catch(() => {});
+    if (c.claim) {
+      if (c.unreachable) continue;
+      const stopped = await remote(run, c.claim.worker, "stop", c.claim);
+      await finish(cfg, { ...c, ...stopped }, "Label entfernt oder Issue geschlossen");
+    } else {
+      await docker(["kill", c.name]).catch(() => {});
+      await docker(["rm", "-f", c.name]).catch(() => {});
+    }
     slots.free++;
   }
 
@@ -727,16 +805,15 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
     if (!phase) continue;
     // Ein gemeinsamer Platz-Pool für alle Phasen. Ohne freien Platz bleibt das Issue in seinem Status und kommt beim nächsten Durchlauf dran.
     if (slots.free <= 0) continue;
-    if (lost && !(await lostJob(cfg, repo, issue))) continue;
 
     if (phase === "accept") {
       if (!prUrl) prUrl = (await findPr(repo, issue.number, "open"))?.url;
       const reworks = reworksSinceApproval(issue);
       const last = reworks >= cfg.maxReworks;
-      await launch(cfg, repo, issue, "accept", mode, prUrl,
-        `Abnahme-Runde: ${reworks + 1}${last ? " (letzte Runde: keine Rückgabe mehr. Bestanden → accepted, sonst unresolved)" : ""}`);
+      if (!await launch(cfg, repo, issue, "accept", mode, prUrl,
+        `Abnahme-Runde: ${reworks + 1}${last ? " (letzte Runde: keine Rückgabe mehr. Bestanden → accepted, sonst unresolved)" : ""}`)) continue;
     } else {
-      await launch(cfg, repo, issue, phase, mode, prUrl);
+      if (!await launch(cfg, repo, issue, phase, mode, prUrl)) continue;
     }
     slots.free--;
   }
@@ -745,16 +822,18 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
 }
 
 async function tick(cfg: Config) {
-  let containers = await listContainers();
+  let containers = await listContainers(cfg);
 
   // 1. Beendete Container auswerten, zu lange laufende stoppen und als Fehlschlag erfassen
   for (const c of containers) {
     try {
+      if (c.unreachable) continue;
       if (!c.running) { await finish(cfg, c); continue; }
       const minutes = (Date.now() - Date.parse(c.startedAt)) / 60000;
       if (minutes > cfg.jobTimeoutMinutes) {
         log("job:timeout", { repo: c.repo, issue: c.issue, minutes: Math.round(minutes) });
-        await docker(["kill", c.name]).catch(() => {});
+        if (c.claim) await remote(run, c.claim.worker, "stop", c.claim);
+        else await docker(["kill", c.name]).catch(() => {});
         await finish(cfg, { ...c, running: false, exitCode: 137, finishedAt: new Date().toISOString() },
           `Zeitlimit von ${cfg.jobTimeoutMinutes} Minuten überschritten.`);
       }
@@ -762,7 +841,7 @@ async function tick(cfg: Config) {
       log("finish:error", { repo: c.repo, issue: c.issue, error: String(e) });
     }
   }
-  containers = (await listContainers()).filter((c) => c.running);
+  containers = (await listContainers(cfg)).filter((c) => c.running || c.claim);
   const improving = await improveRunning(cfg);
   const slots = { free: cfg.maxParallel - containers.length - (improving ? 1 : 0) };
 
@@ -805,6 +884,6 @@ async function main() {
   }
 }
 
-export { finish, tick }; // für Tests
+export { finish, tick, listContainers }; // für Tests
 
 if ((import.meta as any).main) main();

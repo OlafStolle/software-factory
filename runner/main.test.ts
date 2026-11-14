@@ -150,11 +150,12 @@ import { finish } from "./main.ts";
 type Call = { cmd: string[]; stdin: string };
 const calls: Call[] = [];
 let headSha = "abc1234";
+let sshReply: string | undefined;
 (globalThis as any).Bun = {
   spawn(cmd: string[], opts: any) {
     const call: Call = { cmd, stdin: "" };
     calls.push(call);
-    let out = "";
+    let out = cmd[0] === "ssh" ? (sshReply ?? "") : "";
     if (cmd[0] === "gh" && cmd[1] === "issue" && cmd[2] === "view") out = JSON.stringify(issue([]));
     if (cmd[0] === "gh" && cmd[1] === "api" && String(cmd[2]).includes("/git/ref/heads/")) out = headSha + "\n";
     if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "diff") out = "src/app/page.tsx\n";
@@ -227,4 +228,36 @@ test("Fehlerkommentar enthält keine Server-Dateien und keine Tokens", async () 
     startedAt: "2026-11-11T10:00:00Z", finishedAt: "2026-11-11T10:05:00Z", exitCode: 1 });
   const posted = calls.map((x) => x.stdin).join("\n");
   assert.ok(!posted.includes("GEHEIM"));
+});
+
+test("Caddy optional loopback binding retains authentication", () => {
+  const config = caddyConfig(cfg({ preview: { host: "127.0.0.1", bind: "127.0.0.1", password: "x" } }), [1], "HASH");
+  assert.ok(config.includes("bind 127.0.0.1"));
+  assert.ok(config.includes("basic_auth"));
+});
+
+import { loadConfig, listContainers } from './main.ts';
+import { saveClaim } from './workers.ts';
+
+test('tunnel config rejects a domain that could create public automatic HTTPS listeners',()=>{
+ const file=join(tmp(),'config.json');writeFileSync(file,JSON.stringify({preview:{bind:'127.0.0.1',domain:'example.org'}}));
+ assert.throws(()=>loadConfig(file),/automatic HTTPS/);
+});
+test('unreachable persisted remote claim stays occupied in runner inventory',async()=>{
+ const config=cfg();const worker={id:'os',host:'os',hostSlots:1,cpus:2,ssh:'os@host',root:'/tmp/private-worker',authFile:'/tmp/private-auth',slots:1,minFreeMemoryMiB:1000,minFreeDiskMiB:1000};
+ saveClaim(config.dataDir,{worker,name:'sf-a-b-7',repo:'a/b',issue:7,phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'image'});
+ const inventory=await listContainers(config);
+ assert.equal(inventory.length,1);assert.equal(inventory[0].running,true);assert.equal(inventory[0].unreachable,true);assert.equal(inventory[0].claim?.worker.id,'os');
+});
+
+test('remote approved check cannot reuse stale local scenarios',async()=>{
+ const config=cfg();const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});
+ writeFileSync(join(dir,'status.json'),'{"status":"approved"}');
+ const scen=join(config.dataDir,'scenarios','a__b__7');mkdirSync(scen,{recursive:true});writeFileSync(join(scen,'scenarios.md'),'stale');
+ const worker={id:'os',host:'os',hostSlots:1,cpus:2,ssh:'os@host',root:'/tmp/private-worker',authFile:'/tmp/private-auth',slots:1,minFreeMemoryMiB:1000,minFreeDiskMiB:1000};
+ const claim={worker,name:'sf-a-b-7',repo:'a/b',issue:7,phase:'check',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'image'};saveClaim(config.dataDir,claim);
+ sshReply='{}';try{
+   await finish(config,{...claim,phase:'check',running:false,finishedAt:new Date().toISOString(),exitCode:0,claim});
+   const metric=JSON.parse(readFileSync(join(config.dataDir,'metrics.jsonl'),'utf8').trim());assert.equal(metric.status,'failed');
+ }finally{sshReply=undefined;}
 });
