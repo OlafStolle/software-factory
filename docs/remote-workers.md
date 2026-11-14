@@ -48,6 +48,7 @@ Example optional workers (adapt paths and provision credentials first; omitted f
       "hostSlots": 1,
       "cpus": 4,
       "ssh": "os@100.118.14.72",
+      "dockerHost": "unix:///run/user/1000/docker.sock",
       "identityFile": "/etc/software-factory/worker_ed25519",
       "root": "/mnt/data/factory-worker",
       "authFile": "/mnt/data/factory-worker-auth.env",
@@ -100,10 +101,14 @@ Example optional workers (adapt paths and provision credentials first; omitted f
 
 Image transfer exports the immutable ID, compresses with gzip, verifies both process exits and the resulting remote ID, and tags only afterward. Capacity takes both the job filesystem and DockerRootDir into account, including a second disk check immediately before transfer. Each worker records only image IDs it has provisioned. Replacing such a tag attempts to remove its previous owned ID without force; images with any remaining tags/digests are explicitly retained before deletion; existing containers remain protected by Docker and are retained for a later attempt. No global prune occurs.
 
-Offline verification: **36/36 tests passed** (original19 plus transport, scenario isolation, strict SSH, persisted claims/contact loss, resumable cleanup, bounded log tails, image identity/owned cleanup, separate Docker-volume capacity, and loopback-only preview). Actual transport smoke is a separate required rollout gate; it does not establish a Claude product run.
+Offline verification: **38/38 tests passed** (original19 plus transport, scenario isolation, strict SSH, persisted claims/contact loss, resumable cleanup, bounded log tails, image identity/owned cleanup, separate Docker-volume capacity, and loopback-only preview). Actual transport smoke is a separate required rollout gate; it does not establish a Claude product run.
 
 ### Docker storage compatibility
 
 The live smoke exposed that Docker29/containerd reports an OCI index/manifest ID while classic overlay2 reports the image configuration digest for identical content. Therefore the coordinator exports the immutable source ID, derives the exact configuration digest from the single-platform export manifest, and verifies that portable digest on the target. The loaded target ID remains the value used for tagging/owned image cleanup. Both identity paths cache by immutable ID; metadata exports are independently time-bounded. Multi-platform export manifests with more than one entry are rejected instead of guessing.
 
 Initial live smoke failed before any job claim because of this ID mismatch. The correction includes a real Python TAR/Descriptor regression. A repeated live smoke is still required before rollout.
+
+Remote Docker endpoints may explicitly select an owned, readable/writable Unix socket with `dockerHost`; TCP endpoints are rejected. This changes only the worker subprocess environment. The os host uses its existing rootless daemon; its inactive rootful containerd is not restarted. Cleanup uses an isolated no-network helper on the exact owned job directory, including sub-UID-owned private Git directories.
+
+Provisioned remote images are tracked by tag and repository family: a new version retires the previous owned tag only if its raw image ID still matches. Foreign tags/digests and containers protect remaining images. Source/coordinator Docker build-image retention is not managed by this transport; capacity gates stop work before its configured reserve is exhausted.

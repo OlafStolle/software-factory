@@ -9,7 +9,7 @@ const worker = (root: string): Worker => ({ id:'os',host:'os',hostSlots:1,cpus:2
 
 test('worker validation, shared physical-host limits and SSH restrictions', () => {
   const w=worker('/mnt/data/factory-worker'); validateWorkers([w]);
-  for (const bad of [{...w,ssh:'-oProxyCommand=evil'},{...w,root:'/'},{...w,slots:0},{...w,hostSlots:0}]) assert.throws(()=>validateWorkers([bad]));
+  for (const bad of [{...w,ssh:'-oProxyCommand=evil'},{...w,root:'/'},{...w,slots:0},{...w,hostSlots:0},{...w,dockerHost:'tcp://public:2375'},{...w,dockerHost:'unix:///tmp/../docker.sock'}]) assert.throws(()=>validateWorkers([bad]));
   assert.throws(()=>validateWorkers([w,{...w,id:'k2',hostSlots:2}]));
   const cmd=sshCommand(w).join(' ');
   for (const value of ['StrictHostKeyChecking=yes','BatchMode=yes','IdentitiesOnly=yes','worker_ed25519']) assert.ok(cmd.includes(value));
@@ -37,6 +37,8 @@ function hostFixture() {
   writeFileSync(bin,`#!/usr/bin/env python3
 import sys,json,os,pathlib,shutil,tarfile,io
 a=sys.argv[1:]; state=pathlib.Path(os.environ['FAKE_STATE'])
+expected=state.parent/'expected-docker-host'
+if expected.exists(): assert os.environ.get('DOCKER_HOST')==expected.read_text()
 if a[:2]==['image','save']:
  data=json.dumps([{'Config':'blobs/sha256/'+'a'*64}]).encode()
  with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
@@ -47,7 +49,7 @@ elif a[:2]==['image','inspect']:
  if a[-1]=='{{json .Descriptor}}': print('{\"mediaType\":\"application/vnd.oci.image.index.v1+json\"}' if (state.parent/'containerd').exists() else 'null')
  elif a[-1]=='{{json .RepoTags}}': print('[\"foreign:only-tag\"]' if (state.parent/'foreign-tag').exists() else '[]')
  elif a[-1]=='{{json .RepoDigests}}': print('[]')
- else: print(a[2] if a[2].startswith('sha256:') else 'sha256:expected')
+ else: print(json.loads((state.parent/'tag-ids').read_text()).get(a[2],a[2]) if (state.parent/'tag-ids').exists() else (a[2] if a[2].startswith('sha256:') else 'sha256:expected'))
 elif a[:2]==['image','tag']: pass
 elif a[:2]==['image','rm']:
  assert '--force' not in a and '-f' not in a
@@ -60,6 +62,7 @@ elif a[0]=='run' and '--name' in a:
  assert os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')=='private-test-secret'
  state.write_text(json.dumps({'Config':{'Labels':labels},'State':{'Running':False,'StartedAt':'2026-11-14T00:00:00Z','FinishedAt':'2026-11-14T00:01:00Z','ExitCode':0}})); print('containerid')
 elif a[0]=='run':
+ assert a[a.index('--network')+1]=='none' and '-e' not in a and '--env-file' not in a
  mount=a[a.index('-v')+1].split(':')[0]
  for p in pathlib.Path(mount).iterdir():
   if p.is_dir() and not p.is_symlink(): shutil.rmtree(p)
@@ -208,3 +211,27 @@ test('actual Python handler normalizes and caches containerd image config digest
    assert.equal(JSON.parse(readFileSync(join(f.root,'image-config-digests.json'),'utf8'))[index],config);
  }finally{rmSync(f.d,{recursive:true,force:true});}
 });
+
+import { createServer } from 'node:net';
+test('actual handler uses an owned Unix Docker socket and rejects non-sockets',async()=>{
+ const f=hostFixture();const path=join(f.d,'docker.sock');const server=createServer();
+ try{
+   await new Promise<void>(resolve=>server.listen(path,resolve));
+   const w={...f.w,dockerHost:'unix://'+path};writeFileSync(join(f.d,'expected-docker-host'),w.dockerHost);
+   const capacity=await remote(f.exec,w,'capacity');assert.ok(capacity.diskMiB>0);
+   await assert.rejects(remote(f.exec,{...w,dockerHost:'unix://'+f.w.authFile},'capacity'));
+ }finally{await new Promise<void>(resolve=>server.close(()=>resolve()));rmSync(f.d,{recursive:true,force:true});}
+});
+
+ test('versioned image family retires only its own previous tag and preserves foreign tags',async()=>{
+ const f=hostFixture();try{
+   await remote(f.exec,f.w,'tag',{image:'sf-job-project:v1',imageId:'sha256:first'});
+   writeFileSync(join(f.d,'tag-ids'),JSON.stringify({'sf-job-project:v1':'sha256:first'}));
+   writeFileSync(join(f.d,'foreign-tag'),'foreign:only-tag');
+   await remote(f.exec,f.w,'tag',{image:'sf-job-project:v2',imageId:'sha256:second'});
+   assert.equal(readFileSync(join(f.d,'image-removals'),'utf8'),'sf-job-project:v1\n');
+   const tracked=JSON.parse(readFileSync(join(f.root,'owned-images.json'),'utf8'));
+   assert.deepEqual(tracked.current,{'sf-job-project:v2':'sha256:second'});
+   assert.deepEqual(tracked.retired,['sha256:first']);
+ }finally{rmSync(f.d,{recursive:true,force:true});}
+ });

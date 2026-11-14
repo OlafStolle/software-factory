@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 
-export type Worker = { id: string; host: string; hostSlots: number; cpus: number; ssh?: string; identityFile?: string; root: string; authFile?: string; slots: number; minFreeMemoryMiB: number; minFreeDiskMiB: number; enabled?: boolean };
+export type Worker = { id: string; host: string; hostSlots: number; cpus: number; dockerHost?: string; ssh?: string; identityFile?: string; root: string; authFile?: string; slots: number; minFreeMemoryMiB: number; minFreeDiskMiB: number; enabled?: boolean };
 export type Claim = { worker: Worker; name: string; repo: string; issue: number; phase: string; mode: string; startedAt: string; owner: string; image: string };
 export type Execute = (cmd: string[], opts?: { input?: string; timeoutMs?: number }) => Promise<string>;
 
@@ -15,6 +15,7 @@ export function validateWorkers(workers: Worker[]) {
     if (workers.some(other => other.host === w.host && other.hostSlots !== w.hostSlots)) throw new Error("Inconsistent host slot limit");
     if (!/^\/[a-zA-Z0-9_./-]+$/.test(w.root) || w.root.includes("..") || w.root === "/") throw new Error("Invalid worker root");
     if (w.ssh && !/^[a-zA-Z0-9_.@-]+$/.test(w.ssh)) throw new Error("Invalid SSH destination");
+    if (w.dockerHost && (!/^unix:\/\/\/[a-zA-Z0-9_./-]+$/.test(w.dockerHost) || w.dockerHost.includes(".."))) throw new Error("Worker Docker endpoint must be a local Unix socket");
     if (w.identityFile && !/^\/[a-zA-Z0-9_./-]+$/.test(w.identityFile)) throw new Error("Invalid SSH identity path");
     if (w.ssh && (!w.authFile || !/^\/[a-zA-Z0-9_./-]+$/.test(w.authFile))) throw new Error("Remote authFile required");
     if (!/^[a-zA-Z0-9-]+$/.test(w.host)) throw new Error("Invalid physical host id");
@@ -47,7 +48,7 @@ export function claims(dataDir: string): Claim[] {
 export function releaseClaim(dataDir: string, c: Claim) { unlinkSync(claimPath(dataDir, c.repo, c.issue)); }
 export async function remote(exec: Execute, w: Worker, action: string, payload: object = {}) {
   // Never include stdin or command output in an error: it may contain credentials or agent data.
-  try { return JSON.parse(await exec(sshCommand(w), { input: JSON.stringify({ ...payload, action, root: w.root, authFile: w.authFile }), timeoutMs: 120_000 })); }
+  try { return JSON.parse(await exec(sshCommand(w), { input: JSON.stringify({ ...payload, action, root: w.root, authFile: w.authFile, dockerHost: w.dockerHost }), timeoutMs: 120_000 })); }
   catch { throw new Error(`Worker ${w.id}: ${action} unavailable; claim retained`); }
 }
 export function hasCapacity(w: Worker, capacity: { memoryMiB: number; diskMiB: number; dockerDiskMiB?: number }, occupied: number) {
@@ -56,7 +57,7 @@ export function hasCapacity(w: Worker, capacity: { memoryMiB: number; diskMiB: n
 
 /** Stream a missing image without buffering gigabytes in the runner. */
 export async function transferImage(w: Worker, imageId: string) {
-  const ssh = sshCommand(w); ssh[ssh.length - 1] = "bash -o pipefail -c " + quote("gzip -dc | docker image load --quiet");
+  const ssh = sshCommand(w); ssh[ssh.length - 1] = (w.dockerHost ? `env DOCKER_HOST=${quote(w.dockerHost)} ` : "") + "bash -o pipefail -c " + quote("gzip -dc | docker image load --quiet");
   const source = spawn("docker", ["image", "save", imageId], { stdio: ["ignore", "pipe", "ignore"] });
   const gzip = spawn("gzip", ["-1c"], { stdio: ["pipe", "pipe", "ignore"] });
   const target = spawn(ssh[0], ssh.slice(1), { stdio: ["pipe", "pipe", "ignore"] });
@@ -105,6 +106,12 @@ export async function ensureImage(exec: Execute, w: Worker, image: string, sourc
 const HOST = String.raw`
 import json, os, pathlib, stat, subprocess, sys, shutil, tarfile, re, threading
 p=json.load(sys.stdin)
+if p.get('dockerHost'):
+    endpoint=p['dockerHost']
+    if not endpoint.startswith('unix:///'): raise RuntimeError('local Docker socket required')
+    socket=pathlib.Path(endpoint[7:]); metadata=socket.lstat()
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid!=os.getuid() or not os.access(socket,os.R_OK|os.W_OK): raise RuntimeError('Docker socket must be owned and accessible')
+    os.environ['DOCKER_HOST']=endpoint
 root=pathlib.Path(p['root'])
 if not root.is_dir() or root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o022:
     raise RuntimeError('worker root must be private and owned by SSH user')
@@ -165,10 +172,21 @@ if p['action']=='tag':
     manifest=root/'owned-images.json'
     tracked=json.loads(regular(manifest,200000)) if manifest.exists() else {'current':{},'retired':[]}
     old=tracked['current'].get(p['image'])
+    family=lambda tag: tag.rsplit(':',1)[0] if ':' in tag.rsplit('/',1)[-1] else tag
     loaded=p.get('loadedId',p['imageId'])
     docker(['image','tag',loaded,p['image']])
     tracked['current'][p['image']]=loaded
     if old and old!=loaded: tracked['retired'].append(old)
+    for tag, previous in list(tracked['current'].items()):
+        if tag==p['image'] or family(tag)!=family(p['image']): continue
+        # Remove only a tag previously provisioned by us, still pointing to our recorded ID.
+        try:
+            if docker(['image','inspect',tag,'--format','{{.Id}}']).strip()==previous:
+                docker(['image','rm',tag])
+            else: continue
+        except subprocess.CalledProcessError: continue
+        del tracked['current'][tag]
+        tracked['retired'].append(previous)
     retained=[]
     for image in set(tracked['retired']):
         if image in tracked['current'].values(): continue
@@ -283,7 +301,7 @@ elif p['action']=='cleanup':
     if job.exists():
         if job.is_symlink(): raise RuntimeError('invalid job directory')
         # Only this exact owned job mount is removable, never an arbitrary host path.
-        docker(['run','--rm','--user','0','--entrypoint','sh','-v',str(job)+':/cleanup',p['image'],'-c','find /cleanup -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'])
+        docker(['run','--rm','--network','none','--user','0','--entrypoint','sh','-v',str(job)+':/cleanup',p['image'],'-c','find /cleanup -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'])
         job.rmdir()
     if container_exists(): docker(['rm',name])
     marker.unlink(missing_ok=True)
