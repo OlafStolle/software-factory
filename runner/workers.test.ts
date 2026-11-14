@@ -35,11 +35,17 @@ function hostFixture() {
   const w=worker(root); writeFileSync(w.authFile!,'CLAUDE_CODE_OAUTH_TOKEN=private-test-secret\n',{mode:0o600});
   const bin=join(d,'docker'); const state=join(d,'state.json');
   writeFileSync(bin,`#!/usr/bin/env python3
-import sys,json,os,pathlib,shutil
+import sys,json,os,pathlib,shutil,tarfile,io
 a=sys.argv[1:]; state=pathlib.Path(os.environ['FAKE_STATE'])
-if a[0]=='info': print(str(state.parent))
+if a[:2]==['image','save']:
+ data=json.dumps([{'Config':'blobs/sha256/'+'a'*64}]).encode()
+ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
+  info=tarfile.TarInfo('manifest.json');info.size=len(data);archive.addfile(info,io.BytesIO(data))
+ with (state.parent/'exports').open('a') as f: f.write('export')
+elif a[0]=='info': print(str(state.parent))
 elif a[:2]==['image','inspect']:
- if a[-1]=='{{json .RepoTags}}': print('[\"foreign:only-tag\"]' if (state.parent/'foreign-tag').exists() else '[]')
+ if a[-1]=='{{json .Descriptor}}': print('{\"mediaType\":\"application/vnd.oci.image.index.v1+json\"}' if (state.parent/'containerd').exists() else 'null')
+ elif a[-1]=='{{json .RepoTags}}': print('[\"foreign:only-tag\"]' if (state.parent/'foreign-tag').exists() else '[]')
  elif a[-1]=='{{json .RepoDigests}}': print('[]')
  else: print(a[2] if a[2].startswith('sha256:') else 'sha256:expected')
 elif a[:2]==['image','tag']: pass
@@ -138,8 +144,8 @@ test('cleanup resumes after Docker removes container but its response is lost', 
 import { ensureImage } from './workers.ts';
 test('image provision skips identical content and transfers immutable ID before tagging',async()=>{
  const w=worker('/tmp/private-worker');const id='sha256:'+'a'.repeat(64);let actual:string|null=null;const actions:string[]=[];let transferCount=0;
- const exec=async(_cmd:string[],opts:any)=>{const request=JSON.parse(opts.input);actions.push(request.action);if(request.action==='tag')actual=request.imageId;return JSON.stringify({id:actual,diskMiB:30000,dockerDiskMiB:30000});};
- const transfer=async(_w:Worker,image:string)=>{assert.equal(image,id);transferCount++;};
+ const exec=async(_cmd:string[],opts:any)=>{if(_cmd.includes('bash'))return JSON.stringify([{Config:'blobs/sha256/'+id.slice(7)}]);const request=JSON.parse(opts.input);actions.push(request.action);if(request.action==='tag')actual=request.imageId;return JSON.stringify({id:actual,diskMiB:30000,dockerDiskMiB:30000});};
+ const transfer=async(_w:Worker,image:string)=>{assert.equal(image,id);transferCount++;return id;};
  await ensureImage(exec,w,'project:tag',id,transfer);assert.deepEqual(actions,['image','capacity','tag','image']);assert.equal(transferCount,1);
  await ensureImage(exec,w,'project:tag',id,transfer);assert.equal(transferCount,1);
  actual=null;await assert.rejects(ensureImage(exec,w,'project:tag',id,async()=>{throw Error('network lost');}));
@@ -172,5 +178,33 @@ test('image cleanup preserves an old ID with a single foreign tag',async()=>{
    await remote(f.exec,f.w,'tag',{image:'project:tag',imageId:'sha256:second'});
    assert.equal(existsSync(join(f.d,'image-removals')),false);
    assert.deepEqual(JSON.parse(readFileSync(join(f.root,'owned-images.json'),'utf8')).retired,['sha256:first']);
+ }finally{rmSync(f.d,{recursive:true,force:true});}
+});
+
+import { configDigest } from './workers.ts';
+test('containerd index ID and classic config ID share verified portable content identity',async()=>{
+ const source='sha256:'+'c'.repeat(64), config='sha256:'+'d'.repeat(64), w=worker('/tmp/private-worker');
+ let actual:string|null=null;let tag:any;
+ const exec=async(cmd:string[],opts:any)=>{
+   if(cmd.includes('bash'))return JSON.stringify([{Config:'blobs/sha256/'+config.slice(7)}]);
+   const p=JSON.parse(opts.input);
+   if(p.action==='tag'){tag=p;actual=p.imageId;}
+   return JSON.stringify({id:actual,diskMiB:30000,dockerDiskMiB:30000});
+ };
+ const id=await ensureImage(exec,w,'project:tag',source,async(_w, exported)=>{assert.equal(exported,source);return config;});
+ assert.equal(id,config);assert.equal(tag.loadedId,config);assert.equal(tag.imageId,config);
+ assert.equal(configDigest(JSON.stringify([{Config:config.slice(7)+'.json'}])),config);
+ assert.throws(()=>configDigest(JSON.stringify([{Config:'bad'}])));
+ assert.throws(()=>configDigest('[]'));
+});
+
+test('actual Python handler normalizes and caches containerd image config digest',async()=>{
+ const f=hostFixture();try{
+   writeFileSync(join(f.d,'containerd'),'index store');
+   const index='sha256:'+'c'.repeat(64), config='sha256:'+'a'.repeat(64);
+   await remote(f.exec,f.w,'tag',{image:'project:tag',imageId:config,loadedId:index});
+   await remote(f.exec,f.w,'tag',{image:'project:tag',imageId:config,loadedId:index});
+   assert.equal(readFileSync(join(f.d,'exports'),'utf8'),'export');
+   assert.equal(JSON.parse(readFileSync(join(f.root,'image-config-digests.json'),'utf8'))[index],config);
  }finally{rmSync(f.d,{recursive:true,force:true});}
 });

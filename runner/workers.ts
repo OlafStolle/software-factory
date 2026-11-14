@@ -59,38 +59,89 @@ export async function transferImage(w: Worker, imageId: string) {
   const ssh = sshCommand(w); ssh[ssh.length - 1] = "bash -o pipefail -c " + quote("gzip -dc | docker image load --quiet");
   const source = spawn("docker", ["image", "save", imageId], { stdio: ["ignore", "pipe", "ignore"] });
   const gzip = spawn("gzip", ["-1c"], { stdio: ["pipe", "pipe", "ignore"] });
-  const target = spawn(ssh[0], ssh.slice(1), { stdio: ["pipe", "ignore", "ignore"] });
+  const target = spawn(ssh[0], ssh.slice(1), { stdio: ["pipe", "pipe", "ignore"] });
+  let loaded = ""; target.stdout!.on("data", chunk => { loaded = (loaded + chunk.toString()).slice(-32768); });
   const children = [source, gzip, target];
   const done = (child: typeof source) => new Promise<void>((resolve, reject) => {
     child.once("error", reject); child.once("close", code => code === 0 ? resolve() : reject(new Error("Image transfer failed")));
   });
   const stop = () => children.forEach(child => child.kill("SIGKILL"));
-  const timer = setTimeout(stop, 30 * 60_000);
+  const timer = setTimeout(stop, 90 * 60_000);
   try { await Promise.all([...children.map(done), pipeline(source.stdout!, gzip.stdin!), pipeline(gzip.stdout!, target.stdin!)]); }
   catch { stop(); throw new Error(`Worker ${w.id}: image transfer failed`); }
   finally { clearTimeout(timer); }
+  const ids = [...new Set([...loaded.matchAll(/Loaded image ID: (sha256:[a-f0-9]{64})/g)].map(m => m[1]))];
+  if (ids.length !== 1) throw new Error(`Worker ${w.id}: ambiguous loaded image identity`);
+  return ids[0];
 }
-export async function ensureImage(exec: Execute, w: Worker, image: string, imageId: string, transfer = transferImage) {
-  if (!/^sha256:[a-f0-9]{64}$/.test(imageId)) throw new Error("Invalid immutable image ID");
-  if ((await remote(exec, w, "image", { image })).id === imageId) return;
+const imageDigests = new Map<string, string>();
+export function configDigest(manifest: string): string {
+  const entries = JSON.parse(manifest);
+  if (!Array.isArray(entries) || entries.length !== 1) throw new Error("Single-platform image export required");
+  const digest = /^(?:blobs\/sha256\/)?([a-f0-9]{64})(?:\.json)?$/.exec(entries[0].Config)?.[1];
+  if (!digest) throw new Error("Invalid exported image config digest");
+  return `sha256:${digest}`;
+}
+export async function portableImageId(exec: Execute, sourceId: string): Promise<string> {
+  if (!/^sha256:[a-f0-9]{64}$/.test(sourceId)) throw new Error("Invalid immutable image ID");
+  if (!imageDigests.has(sourceId)) {
+    const manifest = await exec(["timeout", "--kill-after=5s", "120s", "bash", "-o", "pipefail", "-c", `docker image save ${sourceId} | tar -xOf - manifest.json`], { timeoutMs: 130_000 });
+    imageDigests.set(sourceId, configDigest(manifest));
+  }
+  return imageDigests.get(sourceId)!;
+}
+export async function ensureImage(exec: Execute, w: Worker, image: string, sourceId: string, transfer = transferImage) {
+  const imageId = await portableImageId(exec, sourceId);
+  if ((await remote(exec, w, "image", { image })).id === imageId) return imageId;
   const capacity = await remote(exec, w, "capacity");
   if (Math.min(capacity.diskMiB, capacity.dockerDiskMiB) < w.minFreeDiskMiB || !Number.isFinite(capacity.dockerDiskMiB)) throw new Error(`Worker ${w.id}: insufficient image disk reserve`);
-  await transfer(w, imageId);
-  await remote(exec, w, "tag", { image, imageId });
+  const loadedId = await transfer(w, sourceId);
+  await remote(exec, w, "tag", { image, imageId, loadedId });
   if ((await remote(exec, w, "image", { image })).id !== imageId) throw new Error(`Worker ${w.id}: image identity mismatch`);
+  return imageId;
 }
 
 // A small SSH request handler, not a resident service. Credentials are loaded only on the worker.
 const HOST = String.raw`
-import json, os, pathlib, stat, subprocess, sys, shutil
+import json, os, pathlib, stat, subprocess, sys, shutil, tarfile, re, threading
 p=json.load(sys.stdin)
 root=pathlib.Path(p['root'])
 if not root.is_dir() or root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o022:
     raise RuntimeError('worker root must be private and owned by SSH user')
 def docker(args):
     return subprocess.check_output(['docker']+args, stderr=subprocess.DEVNULL, timeout=90).decode()
-def image_id(image):
+def raw_image_id(image):
     return docker(['image','inspect',image,'--format','{{.Id}}']).strip()
+def image_id(image):
+    raw=raw_image_id(image)
+    try: descriptor=json.loads(docker(['image','inspect',image,'--format','{{json .Descriptor}}']))
+    except subprocess.CalledProcessError: descriptor=None
+    if not descriptor: return raw
+    cache=root/'image-config-digests.json'
+    values=json.loads(regular(cache,200000)) if cache.exists() else {}
+    if raw in values: return values[raw]
+    proc=subprocess.Popen(['docker','image','save',raw],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    result=None
+    timer=threading.Timer(90, proc.kill); timer.start()
+    try:
+        with tarfile.open(fileobj=proc.stdout,mode='r|') as archive:
+            for member in archive:
+                if member.name=='manifest.json':
+                    if member.size>1000000: raise RuntimeError('oversized image manifest')
+                    entries=json.load(archive.extractfile(member))
+                    if len(entries)!=1: raise RuntimeError('single-platform export required')
+                    match=re.fullmatch(r'(?:blobs/sha256/)?([a-f0-9]{64})(?:\.json)?',entries[0]['Config'])
+                    if not match: raise RuntimeError('bad config digest')
+                    result='sha256:'+match[1]
+        if proc.wait(timeout=120)!=0 or result is None: raise RuntimeError('image export failed')
+    finally:
+        timer.cancel()
+        if proc.poll() is None: proc.kill()
+        proc.wait()
+    values[raw]=result
+    temporary=root/'image-config-digests.tmp'; temporary.unlink(missing_ok=True)
+    safe_write(temporary,json.dumps(values)); os.replace(temporary,cache)
+    return result
 def regular(path, limit, tail=False):
     fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     try:
@@ -110,13 +161,14 @@ if p['action']=='capacity':
     print(json.dumps({'memoryMiB':mem['MemAvailable']//1024,'diskMiB':shutil.disk_usage(root).free//1048576,'dockerDiskMiB':shutil.disk_usage(docker_root).free//1048576}))
     sys.exit()
 if p['action']=='tag':
-    if image_id(p['imageId'])!=p['imageId']: raise RuntimeError('image mismatch')
+    if image_id(p.get('loadedId',p['imageId']))!=p['imageId']: raise RuntimeError('image mismatch')
     manifest=root/'owned-images.json'
     tracked=json.loads(regular(manifest,200000)) if manifest.exists() else {'current':{},'retired':[]}
     old=tracked['current'].get(p['image'])
-    docker(['image','tag',p['imageId'],p['image']])
-    tracked['current'][p['image']]=p['imageId']
-    if old and old!=p['imageId']: tracked['retired'].append(old)
+    loaded=p.get('loadedId',p['imageId'])
+    docker(['image','tag',loaded,p['image']])
+    tracked['current'][p['image']]=loaded
+    if old and old!=loaded: tracked['retired'].append(old)
     retained=[]
     for image in set(tracked['retired']):
         if image in tracked['current'].values(): continue

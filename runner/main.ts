@@ -416,9 +416,9 @@ async function launch(cfg: Config, repo: string, issue: Issue, phase: Phase, mod
   const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
   if (worker?.ssh) {
     const image = await imageFor(cfg, repo);
-    const imageId = (await docker(["image", "inspect", image, "--format", "{{.Id}}"])).trim();
+    const sourceId = (await docker(["image", "inspect", image, "--format", "{{.Id}}"])).trim();
     const claim: Claim = { worker, name, repo, issue: issue.number, phase, mode, startedAt: new Date().toISOString(), owner: randomUUID(), image };
-    await ensureImage(run, worker, image, imageId);
+    const imageId = await ensureImage(run, worker, image, sourceId);
     await remote(run, worker, "preflight", { ...claim, imageId });
     saveClaim(cfg.dataDir, claim);
     await remote(run, worker, "start", {
