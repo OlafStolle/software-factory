@@ -1,0 +1,23 @@
+[Unit]
+Description=Private read-only Factory Kanban
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nv-dev
+WorkingDirectory=/home/nv-dev/software-factory
+Environment=HOME=/home/nv-dev
+Environment=FACTORY_KANBAN_REPO=OlafStolle/Nuova-Vita
+Environment=FACTORY_KANBAN_PORT=4310
+ExecStart=/usr/bin/node /home/nv-dev/software-factory/runner/kanban.mjs
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
