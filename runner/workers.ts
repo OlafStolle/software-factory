@@ -120,8 +120,12 @@ if p['action']=='tag':
     retained=[]
     for image in set(tracked['retired']):
         if image in tracked['current'].values(): continue
-        try: docker(['image','rm',image])
-        except subprocess.CalledProcessError: retained.append(image) # no force: containers/other tags protect it
+        try:
+            tags=json.loads(docker(['image','inspect',image,'--format','{{json .RepoTags}}'])) or []
+            digests=json.loads(docker(['image','inspect',image,'--format','{{json .RepoDigests}}'])) or []
+            if tags or digests: retained.append(image); continue
+            docker(['image','rm',image])
+        except subprocess.CalledProcessError: retained.append(image) # no force: existing containers protect it
     tracked['retired']=retained
     temporary=root/'owned-images.tmp'
     temporary.unlink(missing_ok=True)

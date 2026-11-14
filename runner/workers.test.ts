@@ -38,7 +38,10 @@ function hostFixture() {
 import sys,json,os,pathlib,shutil
 a=sys.argv[1:]; state=pathlib.Path(os.environ['FAKE_STATE'])
 if a[0]=='info': print(str(state.parent))
-elif a[:2]==['image','inspect']: print(a[2] if a[2].startswith('sha256:') else 'sha256:expected')
+elif a[:2]==['image','inspect']:
+ if a[-1]=='{{json .RepoTags}}': print('[\"foreign:only-tag\"]' if (state.parent/'foreign-tag').exists() else '[]')
+ elif a[-1]=='{{json .RepoDigests}}': print('[]')
+ else: print(a[2] if a[2].startswith('sha256:') else 'sha256:expected')
 elif a[:2]==['image','tag']: pass
 elif a[:2]==['image','rm']:
  assert '--force' not in a and '-f' not in a
@@ -159,5 +162,15 @@ test('image cleanup removes only previously recorded owned IDs without force',as
    await remote(f.exec,f.w,'tag',{image:'project:tag',imageId:'sha256:third'});
    const manifest=JSON.parse(readFileSync(join(f.root,'owned-images.json'),'utf8'));
    assert.deepEqual(manifest.retired,['sha256:second']);
+ }finally{rmSync(f.d,{recursive:true,force:true});}
+});
+
+test('image cleanup preserves an old ID with a single foreign tag',async()=>{
+ const f=hostFixture();try{
+   await remote(f.exec,f.w,'tag',{image:'project:tag',imageId:'sha256:first'});
+   writeFileSync(join(f.d,'foreign-tag'),'foreign:only-tag');
+   await remote(f.exec,f.w,'tag',{image:'project:tag',imageId:'sha256:second'});
+   assert.equal(existsSync(join(f.d,'image-removals')),false);
+   assert.deepEqual(JSON.parse(readFileSync(join(f.root,'owned-images.json'),'utf8')).retired,['sha256:first']);
  }finally{rmSync(f.d,{recursive:true,force:true});}
 });
