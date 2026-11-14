@@ -60,9 +60,10 @@ elif a[0]=='run' and '--name' in a:
  labels=dict(a[i+1].split('=',1) for i,v in enumerate(a) if v=='--label')
  assert 'private-test-secret' not in ' '.join(a)
  assert os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')=='private-test-secret'
- state.write_text(json.dumps({'Config':{'Labels':labels},'State':{'Running':False,'StartedAt':'2026-11-14T00:00:00Z','FinishedAt':'2026-11-14T00:01:00Z','ExitCode':0}})); print('containerid')
+ state.write_text(json.dumps({'Image':'sha256:job-immutable','Config':{'Labels':labels},'State':{'Running':False,'StartedAt':'2026-11-14T00:00:00Z','FinishedAt':'2026-11-14T00:01:00Z','ExitCode':0}})); print('containerid')
 elif a[0]=='run':
  assert a[a.index('--network')+1]=='none' and '-e' not in a and '--env-file' not in a
+ assert a[a.index('-c')-1]=='sha256:job-immutable'
  mount=a[a.index('-v')+1].split(':')[0]
  for p in pathlib.Path(mount).iterdir():
   if p.is_dir() and not p.is_symlink(): shutil.rmtree(p)
@@ -235,3 +236,13 @@ test('actual handler uses an owned Unix Docker socket and rejects non-sockets',a
    assert.deepEqual(tracked.retired,['sha256:first']);
  }finally{rmSync(f.d,{recursive:true,force:true});}
  });
+
+test('cleanup pins the inspected image ID even after its version tag is retired',async()=>{
+ const f=hostFixture();try{
+   await remote(f.exec,f.w,'start',f.payload);
+   await remote(f.exec,f.w,'cleanup',{...f.payload,image:'retired:unavailable'});
+   const receipt=JSON.parse(readFileSync(join(f.root,f.payload.name+'.done'),'utf8'));
+   assert.equal(receipt.state.imageId,'sha256:job-immutable');
+   assert.equal(receipt.cleaned,true);
+ }finally{rmSync(f.d,{recursive:true,force:true});}
+});

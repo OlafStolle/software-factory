@@ -234,7 +234,7 @@ def info():
     data=json.loads(docker(['inspect',name]))[0]
     if data['Config']['Labels'].get('sf.owner')!=p['owner']: raise RuntimeError('wrong container owner')
     s=data['State']; labels=data['Config']['Labels']
-    return {'name':name,'running':s['Running'],'startedAt':s['StartedAt'],'finishedAt':s['FinishedAt'],'exitCode':s['ExitCode'],'repo':labels['sf.repo'],'issue':int(labels['sf.issue']),'phase':labels['sf.phase'],'mode':labels['sf.mode']}
+    return {'imageId':data['Image'],'name':name,'running':s['Running'],'startedAt':s['StartedAt'],'finishedAt':s['FinishedAt'],'exitCode':s['ExitCode'],'repo':labels['sf.repo'],'issue':int(labels['sf.issue']),'phase':labels['sf.phase'],'mode':labels['sf.mode']}
 if p['action'] in ('start','preflight'):
     if image_id(p['image']) != p['imageId']: raise RuntimeError('image mismatch')
     auth=pathlib.Path(p['authFile'])
@@ -301,7 +301,7 @@ elif p['action']=='cleanup':
     if job.exists():
         if job.is_symlink(): raise RuntimeError('invalid job directory')
         # Only this exact owned job mount is removable, never an arbitrary host path.
-        docker(['run','--rm','--network','none','--user','0','--entrypoint','sh','-v',str(job)+':/cleanup',p['image'],'-c','find /cleanup -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'])
+        docker(['run','--rm','--network','none','--user','0','--entrypoint','sh','-v',str(job)+':/cleanup',done['state']['imageId'],'-c','find /cleanup -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'])
         job.rmdir()
     if container_exists(): docker(['rm',name])
     marker.unlink(missing_ok=True)

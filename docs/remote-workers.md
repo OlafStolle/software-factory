@@ -101,7 +101,7 @@ Example optional workers (adapt paths and provision credentials first; omitted f
 
 Image transfer exports the immutable ID, compresses with gzip, verifies both process exits and the resulting remote ID, and tags only afterward. Capacity takes both the job filesystem and DockerRootDir into account, including a second disk check immediately before transfer. Each worker records only image IDs it has provisioned. Replacing such a tag attempts to remove its previous owned ID without force; images with any remaining tags/digests are explicitly retained before deletion; existing containers remain protected by Docker and are retained for a later attempt. No global prune occurs.
 
-Offline verification: **38/38 tests passed** (original19 plus transport, scenario isolation, strict SSH, persisted claims/contact loss, resumable cleanup, bounded log tails, image identity/owned cleanup, separate Docker-volume capacity, and loopback-only preview). Actual transport smoke is a separate required rollout gate; it does not establish a Claude product run.
+Offline verification: **39/39 tests passed** (original19 plus transport, scenario isolation, strict SSH, persisted claims/contact loss, resumable cleanup, bounded log tails, image identity/owned cleanup, separate Docker-volume capacity, and loopback-only preview). Actual transport smoke is a separate required rollout gate; it does not establish a Claude product run.
 
 ### Docker storage compatibility
 
@@ -112,3 +112,5 @@ Initial live smoke failed before any job claim because of this ID mismatch. The 
 Remote Docker endpoints may explicitly select an owned, readable/writable Unix socket with `dockerHost`; TCP endpoints are rejected. This changes only the worker subprocess environment. The os host uses its existing rootless daemon; its inactive rootful containerd is not restarted. Cleanup uses an isolated no-network helper on the exact owned job directory, including sub-UID-owned private Git directories.
 
 Provisioned remote images are tracked by tag and repository family: a new version retires the previous owned tag only if its raw image ID still matches. Foreign tags/digests and containers protect remaining images. Source/coordinator Docker build-image retention is not managed by this transport; capacity gates stop work before its configured reserve is exhausted.
+
+Cleanup pins the owned job container’s immutable image ID in its durable receipt, so retirement of a version tag cannot break cleanup or its recovery.
