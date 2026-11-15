@@ -456,8 +456,9 @@ test('quota reset resumes retained writer once; failed session recovery keeps cl
   await finish(config,ended);await finish(config,ended);assert.equal(resumes,0,'cooldown blocks restart');
   writeFileSync(join(config.dataDir,'account-cooldowns.json'),'{"main":0}');
   await finish(config,ended);assert.equal(resumes,1);
-  writeFileSync(join(dir,'claude.jsonl'),result({is_error:true,result:'No conversation found'}));
-  await finish(config,ended);await finish(config,ended);
+  // Early validation failure must not reclassify even a stale prior quota log as resumable.
+  writeFileSync(join(dir,'claude.jsonl'),quotaFiles());
+  await finish(config,{...ended,exitCode:86});await finish(config,{...ended,exitCode:86});
  }finally{scripted=undefined;}
  assert.equal(resumes,1);assert.equal(cleanups,0);assert.equal(claims(config.dataDir).length,1);
  assert.equal(readFileSync(join(dir,'dirty-proof'),'utf8'),'uncommitted');

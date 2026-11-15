@@ -12,7 +12,11 @@ export PHASE="${PHASE:-build}"   # check = prüfen, build = entwickeln, accept =
 WORKFLOW="${WORKFLOW:-starter-kit}"
 
 # Container-local metadata and Claude history survive docker start, never cross phases/hosts.
+# Clear the previous attempt before any validation can exit (never classify its old quota event again).
+: > /work/claude.jsonl
+: > /work/claude.err
 SESSION_FILE="$HOME/.factory-claude-session.json"
+SESSION_STARTED="$HOME/.factory-claude-started"
 RESUMING=false
 if [ -e "$SESSION_FILE" ] || [ -L "$SESSION_FILE" ]; then
   test -f "$SESSION_FILE" && test ! -L "$SESSION_FILE" || exit 86
@@ -23,6 +27,7 @@ if [ -e "$SESSION_FILE" ] || [ -L "$SESSION_FILE" ]; then
   RESUMING=true
   SESSION_ARGS=(--resume "$SESSION_ID")
 else
+  test ! -e "$SESSION_STARTED" && test ! -L "$SESSION_STARTED" || exit 86
   SESSION_ID=$(cat /proc/sys/kernel/random/uuid)
   SESSION_ARGS=(--session-id "$SESSION_ID")
 fi
@@ -76,6 +81,7 @@ if [ "$RESUMING" = false ]; then
   jq -n --arg id "$SESSION_ID" --arg repo "$REPO" --arg issue "$ISSUE" --arg phase "$PHASE" \
     '{id:$id,repo:$repo,issue:$issue,phase:$phase}' > "$SESSION_TMP"
   mv "$SESSION_TMP" "$SESSION_FILE"
+  mkdir "$SESSION_STARTED"
 fi
 set +e
 claude "${SESSION_ARGS[@]}" -p "$(cat /work/prompt.md)" \

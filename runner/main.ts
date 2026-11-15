@@ -530,7 +530,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Claude Code wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
   if (!problem && c.phase === "build" && status.status === "accepting") problem = await checkBuild(c.repo, c.issue, dir, status.pr);
   const worker = c.claim?.worker ?? cfg.workers?.find(w => !w.ssh);
-  const reset = !reason && problem && worker ? quotaReset(tail) : null;
+  const reset = !reason && c.exitCode !== 86 && problem && worker ? quotaReset(tail) : null;
   if (reset && worker) {
     const account = worker.account ?? worker.id;
     coolAccount(cfg.dataDir, account, reset);

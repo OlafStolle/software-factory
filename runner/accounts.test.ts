@@ -59,6 +59,9 @@ echo '{"type":"result","is_error":false}'
   assert.deepEqual(readFileSync(join(home,'calls'),'utf8').trim().split('\n'),['--session-id '+id,'--resume '+id]);
   // Corrupt metadata/phase mismatch never silently starts another session.
   assert.equal(spawnSync('bash',['-c',script],{env:{...env,PHASE:'accept'}}).status,86);
+  assert.equal(readFileSync(join(work,'claude.jsonl'),'utf8'),'');
+  rmSync(join(home,'.factory-claude-session.json'));
+  assert.equal(spawnSync('bash',['-c',script],{env}).status,86,'missing UUID after first start cannot create a fresh writer');
   writeFileSync(join(home,'.factory-claude-session.json'),'{}');
   assert.equal(spawnSync('bash',['-c',script],{env}).status,86);
   assert.equal(readFileSync(join(home,'calls'),'utf8').trim().split('\n').length,2);
