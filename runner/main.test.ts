@@ -307,3 +307,126 @@ test('a failure on the first issue does not starve the next issue in the same or
  };
  try{await tickRepo(config,'a/b',[],{free:2});assert.deepEqual(edits,['7','8']);}finally{scripted=undefined;}
 });
+
+// ---------- Host-Slots mit Improvement, idempotentes Cleanup, Quota-Cleanup-Retry, Cancel eines pausierten Claims ----------
+
+import { maybeImprove } from './main.ts';
+import { readdirSync, existsSync } from 'node:fs';
+const hostWorker=(id:string,ssh?:string)=>({id,host:'os',hostSlots:1,cpus:2,...(ssh?{ssh}:{}),root:'/tmp/private-worker',authFile:'/tmp/private-auth',slots:1,minFreeMemoryMiB:1,minFreeDiskMiB:1});
+const capacityOut=JSON.stringify({memoryMiB:99999,diskMiB:99999,dockerDiskMiB:99999});
+
+test('Improvement laeuft: Produkt startet bei hostSlots=1 nicht auf demselben Host',async()=>{
+ const config=cfg({maxParallel:2,workers:[hostWorker('local'),hostWorker('os','os@host')]});
+ scripted=async(cmd)=>({out:cmd[0]==='ssh'?capacityOut:cmd[0]==='docker'&&cmd[1]==='ps'&&cmd.includes('status=running')?'sf-improve\n':cmd[1]==='info'?tmpdir()+'\n':''});
+ try{assert.equal(await selectWorker(config),null);}finally{scripted=undefined;}
+});
+test('Produkt laeuft: Improvement startet bei hostSlots=1 nicht auf demselben Host',async()=>{
+ const config=cfg({maxParallel:2,factoryRepo:'a/factory',workers:[hostWorker('local'),hostWorker('os','os@host')]});
+ saveClaim(config.dataDir,{worker:config.workers![1],name:'sf-a-b-7',repo:'a/b',issue:7,phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'image'});
+ writeFileSync(join(config.dataDir,'improve-requested'),'');
+ const seen:string[][]=[];
+ scripted=async(cmd)=>{seen.push(cmd);return {out:cmd[0]==='ssh'?'{"running":true}':''};};
+ try{await maybeImprove(config,1).catch(()=>{});}finally{scripted=undefined;}
+ assert.ok(existsSync(join(config.dataDir,'improve-requested')),'Anforderung bleibt bis zum freien Host bestehen');
+ assert.ok(!seen.some(x=>x[0]==='docker'&&x[1]==='run'),'Improvement darf nicht starten');
+});
+test('Cleanup-ACK geht 3x verloren: Resultat, Metriken und Kosten werden genau 1x geschrieben',async()=>{
+ const config=cfg();const worker=hostWorker('os','os@host');
+ const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});
+ writeFileSync(join(dir,'status.json'),'{"status":"review"}');writeFileSync(join(dir,'claude.jsonl'),result({total_cost_usd:1.5}));
+ const claim={worker,name:'sf-a-b-7',repo:'a/b',issue:7,phase:'accept',mode:'new',startedAt:'2026-11-11T10:00:00Z',owner:'nonce',image:'image'};
+ saveClaim(config.dataDir,claim);let lost=3;
+ scripted=async(cmd,input)=>{
+  if(cmd[0]!=='ssh')return {out:''};
+  if(input.includes('"action":"cleanup"')&&lost-->0)return {out:'ACK verloren'};
+  return {out:'{}'};
+ };
+ const ended:any={...claim,running:false,finishedAt:'2026-11-11T10:05:00Z',exitCode:0,claim};
+ try{
+  for(let i=0;i<3;i++)await assert.rejects(finish(config,ended));
+  await finish(config,ended);
+ }finally{scripted=undefined;}
+ const metrics=readFileSync(join(config.dataDir,'metrics.jsonl'),'utf8').trim().split('\n');
+ assert.equal(metrics.length,1);assert.equal(JSON.parse(metrics[0]).costUsd,1.5);
+ assert.equal(readdirSync(join(config.dataDir,'runs')).length,1);
+ assert.equal(claims(config.dataDir).length,0);
+});
+
+const quotaFiles=()=>JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:'rejected',resetsAt:(Date.now()+60000)/1000}})+'\n'+result({is_error:true});
+test('Quota-Requeue: verlorener Cleanup-ACK wiederholt nur Cleanup, nie den Checkpoint',async()=>{
+ const w=quotaWorker('os','main'),config=cfg({workers:[w]});
+ const claim={worker:w,repo:'a/b',issue:7,name:'sf-a-b-7',phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'test'};
+ saveClaim(config.dataDir,claim);
+ const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'claude.jsonl'),quotaFiles());
+ let checkpoints=0,cleanups=0,cleaned=false;
+ scripted=async(cmd,input)=>{
+  if(cmd[0]!=='ssh')return {out:''};
+  const p=JSON.parse(input);
+  if(p.action==='collect')return {out:'{}'};
+  if(p.action==='checkpoint'){checkpoints++;if(cleaned)return {out:'Fehler: completed',code:1};return {out:JSON.stringify({clean:true,resumable:false})};}
+  if(p.action==='cleanup'){cleanups++;cleaned=true;return {out:cleanups===1?'ACK verloren':'{}'};}
+  return {out:'{}'};
+ };
+ const ended:any={...claim,claim,running:false,finishedAt:new Date().toISOString(),exitCode:1};
+ try{
+  await assert.rejects(finish(config,ended));
+  assert.equal(claims(config.dataDir).length,1);
+  await finish(config,ended);
+ }finally{scripted=undefined;}
+ assert.equal(checkpoints,1,'Checkpoint nur einmal');assert.equal(cleanups,2);assert.equal(claims(config.dataDir).length,0);
+});
+
+test('Abbruch eines quota-pausierten Claims gibt den Slot erst mit dem echten Release frei',async()=>{
+ const w=quotaWorker('os','main'),config=cfg({workers:[w],maxParallel:1});
+ const claim={worker:w,repo:'a/b',issue:7,name:'sf-a-b-7',phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'test'};
+ saveClaim(config.dataDir,claim);
+ mkdirSync(join(config.dataDir,'state'),{recursive:true});
+ writeFileSync(join(config.dataDir,'state','a__b__7.json'),JSON.stringify({quotaPause:{account:'main',until:Date.now()+60000,resumable:true}}));
+ scripted=async(cmd)=>cmd[1]==='issue'&&cmd[2]==='list'?{out:'[]'}:{out:'{}'};
+ const c:any={...claim,claim,running:false,finishedAt:new Date().toISOString(),exitCode:1};
+ const slots={free:0};
+ try{await tickRepo(config,'a/b',[c],slots);}finally{scripted=undefined;}
+ assert.equal(claims(config.dataDir).length,1,'Claim bleibt (pausiert)');
+ assert.equal(slots.free,0,'Slot bleibt belegt');
+});
+
+// ---------- Improvement-Anforderung nur nach bestaetigtem Start entfernen; Marker-Datei gehaertet ----------
+
+const improveCfg=()=>{const config=cfg({maxParallel:2,factoryRepo:'a/factory'});writeFileSync(join(config.dataDir,'improve-requested'),'');return config;};
+const noChown={chown:()=>{}};
+test('Improvement-Start schlaegt fehl: Docker wurde erreicht, Anforderung bleibt erhalten',async()=>{
+ const config=improveCfg();const seen:string[]=[];
+ scripted=async(cmd)=>{seen.push(cmd.slice(0,2).join(' '));return cmd[0]==='docker'&&cmd[1]==='run'?{out:'',code:1}:{out:'tok\n'};};
+ try{await assert.rejects(maybeImprove(config,1,noChown));}finally{scripted=undefined;}
+ assert.ok(seen.includes('docker run'),'docker run wurde nachweislich aufgerufen');
+ assert.ok(existsSync(join(config.dataDir,'improve-requested')),'Anforderung bleibt');
+ assert.ok(!existsSync(join(config.dataDir,'improve-last')),'Zeitstempel erst nach Start');
+});
+test('Improvement-Start ok: Anforderung wird entfernt, improve-last geschrieben',async()=>{
+ const config=improveCfg();const seen:string[]=[];
+ scripted=async(cmd)=>{seen.push(cmd.slice(0,2).join(' '));return {out:'tok\n'};};
+ try{await maybeImprove(config,1,noChown);}finally{scripted=undefined;}
+ assert.ok(seen.includes('docker run'));
+ assert.ok(!existsSync(join(config.dataDir,'improve-requested')));
+ assert.ok(existsSync(join(config.dataDir,'improve-last')));
+});
+test('Improvement ohne factoryRepo: Fehlerlog hoechstens einmal je Intervall',async()=>{
+ const config=cfg({maxParallel:2,improve:{everyDays:7}});const lines:string[]=[];const orig=console.log;
+ console.log=(...a:unknown[])=>{lines.push(a.join(' '));};
+ try{await maybeImprove(config,1,noChown);await maybeImprove(config,1,noChown);await maybeImprove(config,1,noChown);}finally{console.log=orig;}
+ assert.equal(lines.filter(l=>l.includes('improve:error')).length,1);
+ assert.ok(existsSync(join(config.dataDir,'improve-last')));
+});
+test('Finalisierungsmarker: 0600 und ein vorhandener Symlink wird nicht verfolgt',async()=>{
+ const w=quotaWorker('os','main'),config=cfg({workers:[w]});
+ const claim={worker:w,repo:'a/b',issue:7,name:'sf-a-b-7',phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'test'};
+ saveClaim(config.dataDir,claim);
+ const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'claude.jsonl'),quotaFiles());
+ const victim=join(tmp(),'victim');writeFileSync(victim,'unberuehrt');
+ const marker=join(config.dataDir,'worker-claims','a__b__7.finalized');symlinkSync(victim,marker);
+ scripted=async(cmd,input)=>{if(cmd[0]!=='ssh')return {out:''};const p=JSON.parse(input);
+  if(p.action==='checkpoint')return {out:JSON.stringify({clean:true,resumable:false})};return {out:p.action==='cleanup'?'ACK verloren':'{}'};};
+ try{await assert.rejects(finish(config,{...claim,claim,running:false,finishedAt:new Date().toISOString(),exitCode:1} as any));}finally{scripted=undefined;}
+ assert.equal(readFileSync(victim,'utf8'),'unberuehrt');
+ assert.equal(lstatSync(marker).isSymbolicLink(),false);assert.equal(lstatSync(marker).mode&0o777,0o600);assert.equal(readFileSync(marker,'utf8'),'nonce');
+});
