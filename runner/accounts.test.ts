@@ -26,8 +26,8 @@ test('os and VPS2 share durable cooldown while K2 stays available after coordina
 });
 
 
-import { execFileSync } from 'node:child_process';
-test('actual entrypoint preserves unpublished build commit and dirty file on same-container restart',()=>{
+import { execFileSync, spawnSync } from 'node:child_process';
+test('actual entrypoint resumes the same Claude session after quota while preserving unpublished and dirty work',()=>{
  const d=mkdtempSync(join(tmpdir(),'sf-resume-'));try{
   const work=join(d,'work'),repo=join(work,'repo'),home=join(d,'home'),bin=join(d,'bin');
   for(const p of [repo,home,bin])mkdirSync(p,{recursive:true});
@@ -39,9 +39,32 @@ test('actual entrypoint preserves unpublished build commit and dirty file on sam
   writeFileSync(join(repo,'file'),'unpublished');git('commit','-am','unpublished');const head=git('rev-parse','HEAD');
   writeFileSync(join(repo,'file'),'dirty');writeFileSync(join(work,'prompt.md'),'test');
   writeFileSync(join(bin,'gh'),'#!/bin/sh\ncase "$*" in *defaultBranchRef*) echo main;; *login*) echo test;; *id*) echo 1;; esac\n',{mode:0o700});
-  writeFileSync(join(bin,'claude'),`#!/bin/sh\necho '{"type":"result","is_error":false}'\n`,{mode:0o700});
+  writeFileSync(join(bin,'claude'),`#!/bin/sh
+printf '%s\\n' "$1 $2" >> "$HOME/calls"
+if [ "$1" = --session-id ]; then
+ printf '%s' "$2" > "$HOME/mock-history"
+ echo '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}'
+ echo '{"type":"result","is_error":true}'
+ exit 1
+fi
+test "$1" = --resume && test "$(cat "$HOME/mock-history")" = "$2" || exit 2
+echo '{"type":"result","is_error":false}'
+`,{mode:0o700});
   const script=readFileSync(new URL('../image/entrypoint.sh',import.meta.url),'utf8').replaceAll('/work',work).replaceAll('/factory',join(d,'factory'));
-  execFileSync('bash',['-c',script],{env:{...process.env,HOME:home,PATH:bin+':'+process.env.PATH,REPO:'a/b',ISSUE:'1',BRANCH:'factory/1',PHASE:'build'},stdio:'pipe'});
+  const env={...process.env,HOME:home,PATH:bin+':'+process.env.PATH,REPO:'a/b',ISSUE:'1',BRANCH:'factory/1',PHASE:'build'};
+  assert.equal(spawnSync('bash',['-c',script],{env}).status,1);
+  assert.ok(quotaReset(readFileSync(join(work,'claude.jsonl'),'utf8')));
+  const id=JSON.parse(readFileSync(join(home,'.factory-claude-session.json'),'utf8')).id;
+  assert.equal(spawnSync('bash',['-c',script],{env}).status,0);
+  assert.deepEqual(readFileSync(join(home,'calls'),'utf8').trim().split('\n'),['--session-id '+id,'--resume '+id]);
+  // Corrupt metadata/phase mismatch never silently starts another session.
+  assert.equal(spawnSync('bash',['-c',script],{env:{...env,PHASE:'accept'}}).status,86);
+  assert.equal(readFileSync(join(work,'claude.jsonl'),'utf8'),'');
+  rmSync(join(home,'.factory-claude-session.json'));
+  assert.equal(spawnSync('bash',['-c',script],{env}).status,86,'missing UUID after first start cannot create a fresh writer');
+  writeFileSync(join(home,'.factory-claude-session.json'),'{}');
+  assert.equal(spawnSync('bash',['-c',script],{env}).status,86);
+  assert.equal(readFileSync(join(home,'calls'),'utf8').trim().split('\n').length,2);
   assert.equal(git('rev-parse','HEAD'),head);assert.equal(readFileSync(join(repo,'file'),'utf8'),'dirty');
  }finally{rmSync(d,{recursive:true,force:true});}
 });

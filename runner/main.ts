@@ -150,7 +150,7 @@ export function redact(text: string): string {
 
 // ---------- Dauerhafter Zustand pro Issue (nur für den Runner) ----------
 
-type IssueState = { lostRetries?: number; quotaRetry?: Phase; quotaPause?: { account: string; until: number; resumable: boolean } };
+type IssueState = { resumeAttempt?: boolean; lostRetries?: number; quotaRetry?: Phase; quotaPause?: { account: string; until: number; resumable: boolean } };
 const stateFile = (cfg: Config, repo: string, n: number) => join(cfg.dataDir, "state", `${repo.replace("/", "__")}__${n}.json`);
 function getState(cfg: Config, repo: string, n: number): IssueState {
   try { return JSON.parse(readFileSync(stateFile(cfg, repo, n), "utf8")); } catch { return {}; }
@@ -490,7 +490,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     }
     if (!hasCapacity(worker, available, 0)) return;
     // Clear before starting: an ambiguous reply retains the container/claim, never creates another writer.
-    setState(cfg, c.repo, c.issue, {});
+    setState(cfg, c.repo, c.issue, { resumeAttempt: true });
     if (c.claim) await remote(run, worker, "resume", c.claim); else await docker(["start", c.name]);
     log("job:resumed", { repo: c.repo, issue: c.issue, worker: worker.id }); return;
   }
@@ -530,7 +530,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Claude Code wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
   if (!problem && c.phase === "build" && status.status === "accepting") problem = await checkBuild(c.repo, c.issue, dir, status.pr);
   const worker = c.claim?.worker ?? cfg.workers?.find(w => !w.ssh);
-  const reset = !reason && problem && worker ? quotaReset(tail) : null;
+  const reset = !reason && c.exitCode !== 86 && problem && worker ? quotaReset(tail) : null;
   if (reset && worker) {
     const account = worker.account ?? worker.id;
     coolAccount(cfg.dataDir, account, reset);
@@ -555,6 +555,13 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     else await docker(["rm", c.name]);
     log("job:quota-requeued", { repo: c.repo, issue: c.issue, account, until: reset });
     await comment(c.repo, c.issue, `quota:${c.phase}`, `Kontingent von ${account} erreicht. Der unveränderte/gepushte Arbeitsplatz ist gesichert; die Factory setzt den Auftrag mit einem verfügbaren Konto fort.`);
+    return;
+  }
+  // A retained dirty workspace must not be deleted if session recovery fails. Never fall back to a fresh writer.
+  if (problem && getState(cfg, c.repo, c.issue).resumeAttempt) {
+    setState(cfg, c.repo, c.issue, { quotaPause: { account: worker?.account ?? worker?.id ?? "unknown", until: 0, resumable: false } });
+    log("job:resume-blocked", { repo: c.repo, issue: c.issue });
+    await comment(c.repo, c.issue, `resume-blocked:${c.phase}`, "Wiederaufnahme fehlgeschlagen. Arbeitsplatz, Sitzung und Claim bleiben zur Prüfung erhalten; kein neuer Writer wird gestartet.");
     return;
   }
   const ended = !problem;

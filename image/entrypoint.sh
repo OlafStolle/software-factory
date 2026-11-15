@@ -11,6 +11,27 @@ MODEL="${MODEL:-opus}"
 export PHASE="${PHASE:-build}"   # check = prüfen, build = entwickeln, accept = unabhängige Abnahme
 WORKFLOW="${WORKFLOW:-starter-kit}"
 
+# Container-local metadata and Claude history survive docker start, never cross phases/hosts.
+# Clear the previous attempt before any validation can exit (never classify its old quota event again).
+: > /work/claude.jsonl
+: > /work/claude.err
+SESSION_FILE="$HOME/.factory-claude-session.json"
+SESSION_STARTED="$HOME/.factory-claude-started"
+RESUMING=false
+if [ -e "$SESSION_FILE" ] || [ -L "$SESSION_FILE" ]; then
+  test -f "$SESSION_FILE" && test ! -L "$SESSION_FILE" || exit 86
+  SESSION_ID=$(jq -er --arg repo "$REPO" --arg issue "$ISSUE" --arg phase "$PHASE" \
+    'select(.repo == $repo and .issue == $issue and .phase == $phase) | .id | select(test("^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$"))' "$SESSION_FILE") || exit 86
+  test "$PHASE" = build && test -d /work/repo/.git || exit 86
+  test "$(git -C /work/repo branch --show-current)" = "$BRANCH" || exit 86
+  RESUMING=true
+  SESSION_ARGS=(--resume "$SESSION_ID")
+else
+  test ! -e "$SESSION_STARTED" && test ! -L "$SESSION_STARTED" || exit 86
+  SESSION_ID=$(cat /proc/sys/kernel/random/uuid)
+  SESSION_ARGS=(--session-id "$SESSION_ID")
+fi
+
 # Workflow-Skills als Nutzer-Skills bereitstellen (landen nicht im Ziel-Repo)
 mkdir -p "$HOME/.claude/skills"
 if [ -d "/factory/workflows/$WORKFLOW/skills" ]; then
@@ -44,7 +65,7 @@ else
 fi
 
 # Abhängigkeiten installieren (zum Entwickeln und für die Abnahme nötig)
-if [ "$PHASE" != "check" ] && [ -f .factory/setup.json ]; then
+if [ "$RESUMING" = false ] && [ "$PHASE" != "check" ] && [ -f .factory/setup.json ]; then
   INSTALL=$(jq -r '.install // empty' .factory/setup.json)
   if [ -n "$INSTALL" ]; then
     log "Setup: $INSTALL"
@@ -54,8 +75,16 @@ fi
 
 export FACTORY_DEFAULT_BRANCH="$DEFAULT_BRANCH"
 log "Starte Claude Code ($MODEL, Phase: $PHASE, Workflow: $WORKFLOW) für $REPO#$ISSUE auf $BRANCH"
+if [ "$RESUMING" = false ]; then
+  umask 077
+  SESSION_TMP=$(mktemp "$HOME/.factory-session.XXXXXX")
+  jq -n --arg id "$SESSION_ID" --arg repo "$REPO" --arg issue "$ISSUE" --arg phase "$PHASE" \
+    '{id:$id,repo:$repo,issue:$issue,phase:$phase}' > "$SESSION_TMP"
+  mv "$SESSION_TMP" "$SESSION_FILE"
+  mkdir "$SESSION_STARTED"
+fi
 set +e
-claude -p "$(cat /work/prompt.md)" \
+claude "${SESSION_ARGS[@]}" -p "$(cat /work/prompt.md)" \
   --append-system-prompt-file /factory/playbook.md \
   --add-dir "/factory/workflows/$WORKFLOW" \
   --model "$MODEL" \

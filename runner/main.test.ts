@@ -430,3 +430,38 @@ test('Finalisierungsmarker: 0600 und ein vorhandener Symlink wird nicht verfolgt
  assert.equal(readFileSync(victim,'utf8'),'unberuehrt');
  assert.equal(lstatSync(marker).isSymbolicLink(),false);assert.equal(lstatSync(marker).mode&0o777,0o600);assert.equal(readFileSync(marker,'utf8'),'nonce');
 });
+
+
+test('quota reset resumes retained writer once; failed session recovery keeps claim and dirty workspace',async()=>{
+ const w=quotaWorker('os','main'),config=cfg({workers:[w]});
+ const claim={worker:w,repo:'a/b',issue:7,name:'sf-a-b-7',phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'test'};
+ saveClaim(config.dataDir,claim);
+ const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});
+ writeFileSync(join(dir,'claude.jsonl'),quotaFiles());writeFileSync(join(dir,'dirty-proof'),'uncommitted');
+ let resumes=0,cleanups=0;
+ scripted=async(cmd,input)=>{
+  if(cmd[0]==='ssh'){
+   const p=JSON.parse(input);
+   if(p.action==='checkpoint')return {out:'{"clean":false,"resumable":true}'};
+   if(p.action==='capacity')return {out:capacityOut};
+   if(p.action==='resume')resumes++;
+   if(p.action==='cleanup')cleanups++;
+   return {out:'{}'};
+  }
+  if(cmd[1]==='issue'&&cmd[2]==='view')return {out:'{"state":"OPEN","labels":[{"name":"factory"}]}'};
+  return {out:''};
+ };
+ const ended:any={...claim,claim,running:false,finishedAt:new Date().toISOString(),exitCode:1};
+ try{
+  await finish(config,ended);await finish(config,ended);assert.equal(resumes,0,'cooldown blocks restart');
+  writeFileSync(join(config.dataDir,'account-cooldowns.json'),'{"main":0}');
+  await finish(config,ended);assert.equal(resumes,1);
+  // Early validation failure must not reclassify even a stale prior quota log as resumable.
+  writeFileSync(join(dir,'claude.jsonl'),quotaFiles());
+  await finish(config,{...ended,exitCode:86});await finish(config,{...ended,exitCode:86});
+ }finally{scripted=undefined;}
+ assert.equal(resumes,1);assert.equal(cleanups,0);assert.equal(claims(config.dataDir).length,1);
+ assert.equal(readFileSync(join(dir,'dirty-proof'),'utf8'),'uncommitted');
+ const state=JSON.parse(readFileSync(join(config.dataDir,'state','a__b__7.json'),'utf8'));
+ assert.equal(state.quotaPause.resumable,false);
+});
