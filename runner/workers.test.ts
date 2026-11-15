@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { claims, saveClaim, releaseClaim, remote, validateWorkers, hasCapacity, sshCommand, type Worker, type Claim } from './workers.ts';
 const worker = (root: string): Worker => ({ id:'os',host:'os',hostSlots:1,cpus:2,ssh:'os@100.118.14.72',identityFile:'/etc/software-factory/worker_ed25519',root,authFile:join(root,'auth.env'),slots:1,minFreeMemoryMiB:4096,minFreeDiskMiB:20480 });
 
@@ -35,7 +35,7 @@ function hostFixture() {
   const w=worker(root); writeFileSync(w.authFile!,'CLAUDE_CODE_OAUTH_TOKEN=private-test-secret\n',{mode:0o600});
   const bin=join(d,'docker'); const state=join(d,'state.json');
   writeFileSync(bin,`#!/usr/bin/env python3
-import sys,json,os,pathlib,shutil,tarfile,io
+import sys,json,os,pathlib,shutil,tarfile,io,subprocess
 a=sys.argv[1:]; state=pathlib.Path(os.environ['FAKE_STATE'])
 expected=state.parent/'expected-docker-host'
 if expected.exists(): assert os.environ.get('DOCKER_HOST')==expected.read_text()
@@ -57,10 +57,18 @@ elif a[:2]==['image','rm']:
  if (state.parent/'protected-image').exists(): sys.exit(1)
 elif a[0]=='inspect': print(json.dumps([json.loads(state.read_text())]))
 elif a[0]=='run' and '--name' in a:
- labels=dict(a[i+1].split('=',1) for i,v in enumerate(a) if v=='--label')
+ labels=dict(a[i+1].split('=',1) for i,v in enumerate(a) if v=='--label'); labels['sf.resume-safe']='1'
  assert 'private-test-secret' not in ' '.join(a)
  assert os.environ.get('CLAUDE_CODE_OAUTH_TOKEN')=='private-test-secret'
  state.write_text(json.dumps({'Image':'sha256:job-immutable','Config':{'Labels':labels},'State':{'Running':False,'StartedAt':'2026-11-14T00:00:00Z','FinishedAt':'2026-11-14T00:01:00Z','ExitCode':0}})); print('containerid')
+elif a[0]=='start':
+ data=json.loads(state.read_text());data['State']['Running']=True;state.write_text(json.dumps(data))
+elif a[0]=='run' and a[a.index('-v')+1].endswith('/work:ro'):
+ assert a[a.index('--network')+1]=='none' and '-e' not in a and '--env-file' not in a
+ mount=a[a.index('-v')+1].split(':')[0]
+ script=a[a.index('-c')+1].replace('/work',mount)
+ result=subprocess.run(['sh','-c',script,'sh',a[-1]],capture_output=True,text=True)
+ print(result.stdout,end='');sys.exit(result.returncode)
 elif a[0]=='run':
  assert a[a.index('--network')+1]=='none' and '-e' not in a and '--env-file' not in a
  assert a[a.index('-c')-1]=='sha256:job-immutable'
@@ -244,5 +252,29 @@ test('cleanup pins the inspected image ID even after its version tag is retired'
    const receipt=JSON.parse(readFileSync(join(f.root,f.payload.name+'.done'),'utf8'));
    assert.equal(receipt.state.imageId,'sha256:job-immutable');
    assert.equal(receipt.cleaned,true);
+ }finally{rmSync(f.d,{recursive:true,force:true});}
+});
+
+
+test('actual checkpoint distinguishes pushed, dirty and unpublished work; only owned stopped job resumes',async()=>{
+ const f=hostFixture();try{
+  await remote(f.exec,f.w,'start',f.payload);
+  const repo=join(f.root,f.payload.name,'work','repo');mkdirSync(repo);
+  const git=(...args:string[])=>execFileSync('git',args,{cwd:repo,stdio:'pipe'});
+  git('init','-b','factory/1');git('config','user.name','test');git('config','user.email','test@example.org');
+  writeFileSync(join(repo,'file'),'base');git('add','.');git('commit','-m','base');git('update-ref','refs/remotes/origin/main','HEAD');
+  assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:true,resumable:true});
+  writeFileSync(join(repo,'file'),'dirty');
+  assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:true});
+  git('add','.');git('commit','-m','unpublished');
+  assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:true});
+  await assert.rejects(remote(f.exec,f.w,'resume',{...f.payload,owner:'foreign'}));
+  const stateFile=join(f.d,'state.json'),old=JSON.parse(readFileSync(stateFile,'utf8'));delete old.Config.Labels['sf.resume-safe'];writeFileSync(stateFile,JSON.stringify(old));
+  assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:false});
+  await assert.rejects(remote(f.exec,f.w,'resume',f.payload));
+  old.Config.Labels['sf.resume-safe']='1';writeFileSync(stateFile,JSON.stringify(old));
+  await remote(f.exec,f.w,'resume',f.payload);
+  assert.equal((await remote(f.exec,f.w,'inspect',f.payload)).running,true);
+  await assert.rejects(remote(f.exec,f.w,'checkpoint',f.payload));
  }finally{rmSync(f.d,{recursive:true,force:true});}
 });

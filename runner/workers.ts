@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 
-export type Worker = { id: string; host: string; hostSlots: number; cpus: number; dockerHost?: string; ssh?: string; identityFile?: string; root: string; authFile?: string; slots: number; minFreeMemoryMiB: number; minFreeDiskMiB: number; enabled?: boolean };
+export type Worker = { id: string; account?: string; host: string; hostSlots: number; cpus: number; dockerHost?: string; ssh?: string; identityFile?: string; root: string; authFile?: string; slots: number; minFreeMemoryMiB: number; minFreeDiskMiB: number; enabled?: boolean };
 export type Claim = { worker: Worker; name: string; repo: string; issue: number; phase: string; mode: string; startedAt: string; owner: string; image: string };
 export type Execute = (cmd: string[], opts?: { input?: string; timeoutMs?: number }) => Promise<string>;
 
@@ -12,6 +12,7 @@ export function validateWorkers(workers: Worker[]) {
   for (const w of workers) {
     if (!/^[a-z][a-z0-9-]{0,31}$/.test(w.id) || ids.has(w.id)) throw new Error("Invalid/duplicate worker id");
     ids.add(w.id);
+    if (w.account && !/^[a-z][a-z0-9-]{0,31}$/.test(w.account)) throw new Error("Invalid account id");
     if (workers.some(other => other.host === w.host && other.hostSlots !== w.hostSlots)) throw new Error("Inconsistent host slot limit");
     if (!/^\/[a-zA-Z0-9_./-]+$/.test(w.root) || w.root.includes("..") || w.root === "/") throw new Error("Invalid worker root");
     if (w.ssh && !/^[a-zA-Z0-9_.@-]+$/.test(w.ssh)) throw new Error("Invalid SSH destination");
@@ -234,7 +235,7 @@ def info():
     data=json.loads(docker(['inspect',name]))[0]
     if data['Config']['Labels'].get('sf.owner')!=p['owner']: raise RuntimeError('wrong container owner')
     s=data['State']; labels=data['Config']['Labels']
-    return {'imageId':data['Image'],'name':name,'running':s['Running'],'startedAt':s['StartedAt'],'finishedAt':s['FinishedAt'],'exitCode':s['ExitCode'],'repo':labels['sf.repo'],'issue':int(labels['sf.issue']),'phase':labels['sf.phase'],'mode':labels['sf.mode']}
+    return {'resumeSafe':labels.get('sf.resume-safe')=='1','imageId':data['Image'],'name':name,'running':s['Running'],'startedAt':s['StartedAt'],'finishedAt':s['FinishedAt'],'exitCode':s['ExitCode'],'repo':labels['sf.repo'],'issue':int(labels['sf.issue']),'phase':labels['sf.phase'],'mode':labels['sf.mode']}
 if p['action'] in ('start','preflight'):
     if image_id(p['image']) != p['imageId']: raise RuntimeError('image mismatch')
     auth=pathlib.Path(p['authFile'])
@@ -276,6 +277,21 @@ elif p['action']=='inspect':
     done=completed()
     if done: print(json.dumps(done['state']))
     else: owned(); print(json.dumps(info()))
+elif p['action']=='checkpoint':
+    owned(); state=info()
+    if state['running'] or completed(): raise RuntimeError('checkpoint requires stopped owned job')
+    script='cd /work/repo || exit 2; test -d .git || exit 2; test "$(git branch --show-current)" = "$1" || exit 2; dirty=$(git status --porcelain --untracked-files=all) || exit 2; ahead=$(git log --branches --not --remotes --format=%H) || exit 2; if test -z "$dirty" && test -z "$ahead"; then printf clean; else printf dirty; fi'
+    if not (job/'work'/'repo').exists(): print(json.dumps({'clean':True,'resumable':False}))
+    else:
+        try:
+            result=docker(['run','--rm','--network','none','--entrypoint','sh','-v',str(job/'work')+':/work:ro',state['imageId'],'-c',script,'sh','factory/'+str(p['issue'])]).strip()
+            print(json.dumps({'clean':result=='clean','resumable':state['resumeSafe'] and result in ('clean','dirty')}))
+        except subprocess.CalledProcessError: print(json.dumps({'clean':False,'resumable':False}))
+elif p['action']=='resume':
+    owned(); state=info()
+    if completed() or not state['resumeSafe']: raise RuntimeError('job image cannot safely resume')
+    if not state['running']: docker(['start',name])
+    print(json.dumps(info()))
 elif p['action']=='stop':
     done=completed()
     if done: print(json.dumps(done['state']))

@@ -151,10 +151,15 @@ type Call = { cmd: string[]; stdin: string };
 const calls: Call[] = [];
 let headSha = "abc1234";
 let sshReply: string | undefined;
+let scripted: ((cmd: string[], input: string) => Promise<{out:string; code?:number}>) | undefined;
 (globalThis as any).Bun = {
   spawn(cmd: string[], opts: any) {
     const call: Call = { cmd, stdin: "" };
     calls.push(call);
+    if (scripted) {
+      const answer = (async()=> { call.stdin = opts.stdin instanceof Blob ? await opts.stdin.text() : ""; return scripted!(cmd,call.stdin); })();
+      return { stdout: new ReadableStream({async start(controller){controller.enqueue(new TextEncoder().encode((await answer).out));controller.close();}}), stderr:new Blob([""]).stream(), kill(){}, exited:answer.then(a=>a.code??0) };
+    }
     let out = cmd[0] === "ssh" ? (sshReply ?? "") : "";
     if (cmd[0] === "gh" && cmd[1] === "issue" && cmd[2] === "view") out = JSON.stringify(issue([]));
     if (cmd[0] === "gh" && cmd[1] === "api" && String(cmd[2]).includes("/git/ref/heads/")) out = headSha + "\n";
@@ -260,4 +265,45 @@ test('remote approved check cannot reuse stale local scenarios',async()=>{
    await finish(config,{...claim,phase:'check',running:false,finishedAt:new Date().toISOString(),exitCode:0,claim});
    const metric=JSON.parse(readFileSync(join(config.dataDir,'metrics.jsonl'),'utf8').trim());assert.equal(metric.status,'failed');
  }finally{sshReply=undefined;}
+});
+
+
+import { selectWorker, tickRepo } from './main.ts';
+import { claims } from './workers.ts';
+import { accountUntil, coolAccount } from './accounts.ts';
+const quotaWorker=(id:string,account:string,host=id)=>({id,account,host,slots:1,hostSlots:1,cpus:1,root:'/tmp/worker-'+id,ssh:id,authFile:'/tmp/auth',minFreeMemoryMiB:8192,minFreeDiskMiB:10240});
+
+test('cooled shared account skips os and VPS2 but selects distinct K2 account',async()=>{
+ const os=quotaWorker('os','main'),local={...quotaWorker('vps2','main'),ssh:undefined},k2=quotaWorker('k2','k2','vps2');
+ const config=cfg({workers:[os,local,k2]});coolAccount(config.dataDir,'main',Date.now()+60000);
+ scripted=async(cmd,input)=>({out:cmd[0]==='ssh'?JSON.stringify({memoryMiB:20000,diskMiB:20000,dockerDiskMiB:20000}):''});
+ try{assert.equal((await selectWorker(config))?.id,'k2');}finally{scripted=undefined;}
+});
+
+test('quota exit requeues only proven clean work; dirty work retains its exact claim and resumes after reset',async()=>{
+ for(const clean of [true,false]){
+ const w=quotaWorker('os','main'),config=cfg({workers:[w]});const claim={worker:w,repo:'a/b',issue:7,name:'sf-a-b-7',phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'test'};
+ saveClaim(config.dataDir,claim);let resumed=false,cleaned=false;
+ const files={'claude.jsonl':JSON.stringify({type:'rate_limit_event',rate_limit_info:{status:'rejected',resetsAt:(Date.now()+60000)/1000}})+'\n'+result({is_error:true})};
+ const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'claude.jsonl'),files['claude.jsonl']);
+ scripted=async(cmd,input)=>{
+  if(cmd[0]==='ssh'){const p=JSON.parse(input);if(p.action==='collect')return {out:'{}'};if(p.action==='checkpoint')return {out:JSON.stringify({clean,resumable:true})};if(p.action==='cleanup')cleaned=true;if(p.action==='resume')resumed=true;return {out:JSON.stringify({memoryMiB:20000,diskMiB:20000,dockerDiskMiB:20000})};}
+  return {out:cmd[1]==='issue'&&cmd[2]==='view'?JSON.stringify({state:'OPEN',labels:[{name:'factory'}]}):''};
+ };
+ const c:any={...claim,claim,running:false,finishedAt:new Date().toISOString(),exitCode:1};
+ try{
+ await finish(config,c);assert.ok(accountUntil(config.dataDir,'main')>Date.now());assert.equal(cleaned,clean);assert.equal(claims(config.dataDir).length,clean?0:1);
+ if(!clean){await finish(config,c);assert.equal(resumed,false);writeFileSync(join(config.dataDir,'account-cooldowns.json'),JSON.stringify({main:0}));await finish(config,c);assert.equal(resumed,true);assert.equal(cleaned,false);assert.equal(claims(config.dataDir).length,1);}
+ }finally{scripted=undefined;}
+ }
+});
+
+test('a failure on the first issue does not starve the next issue in the same original tick',async()=>{
+ const config=cfg({workers:[]});const edits:string[]=[];
+ scripted=async(cmd)=>{
+  if(cmd[1]==='issue'&&cmd[2]==='list')return {out:JSON.stringify(cmd.includes('closed')?[]:[{...issue([]),number:7},{...issue([]),number:8}])};
+  if(cmd[1]==='issue'&&cmd[2]==='edit'){edits.push(cmd[3]);return {out:'',code:cmd[3]==='7'?1:0};}
+  return {out:''};
+ };
+ try{await tickRepo(config,'a/b',[],{free:2});assert.deepEqual(edits,['7','8']);}finally{scripted=undefined;}
 });
