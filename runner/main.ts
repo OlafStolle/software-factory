@@ -10,7 +10,7 @@ import {
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { quotaReset, accountUntil, coolAccount } from "./accounts.ts";
-import { claims, saveClaim, releaseClaim, remote, ensureImage, validateWorkers, hasCapacity, type Worker, type Claim } from "./workers.ts";
+import { claimPath, claims, saveClaim, releaseClaim, remote, ensureImage, validateWorkers, hasCapacity, type Worker, type Claim } from "./workers.ts";
 
 export type Config = {
   workers?: Worker[];
@@ -313,14 +313,21 @@ async function listContainers(cfg: Config): Promise<Container[]> {
   return result;
 }
 
+/** Jobs occupying a physical host: product containers/claims plus a running improvement container (always local). */
+function onHostCount(cfg: Config, current: Container[], host: string, improving: boolean): number {
+  const isLocalHost = cfg.workers!.some(l => !l.ssh && l.host === host);
+  return current.filter(c => c.claim ? c.claim.worker.host === host : isLocalHost).length + (improving && isLocalHost ? 1 : 0);
+}
+const improveActive = async () => (await docker(["ps", "--filter", "label=sf.improve=1", "--filter", "status=running", "--format", "{{.Names}}"])).trim() !== "";
+
 async function selectWorker(cfg: Config): Promise<Worker | undefined | null> {
   if (!cfg.workers) return undefined;
   const current = await listContainers(cfg);
+  const improving = await improveActive();
   for (const w of cfg.workers) {
     if (w.enabled === false || accountUntil(cfg.dataDir, w.account ?? w.id) > Date.now()) continue;
     const occupied = current.filter(c => c.claim ? c.claim.worker.id === w.id : !w.ssh).length;
-    const onHost = current.filter(c => c.claim ? c.claim.worker.host === w.host : cfg.workers!.some(l => !l.ssh && l.host === w.host)).length;
-    if (onHost >= w.hostSlots) continue;
+    if (onHostCount(cfg, current, w.host, improving) >= w.hostSlots) continue;
     try {
       const capacity = w.ssh ? await remote(run, w, "capacity") : {
         memoryMiB: Number(readFileSync("/proc/meminfo", "utf8").match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0) / 1024,
@@ -487,6 +494,15 @@ async function finish(cfg: Config, c: Container, reason?: string) {
     if (c.claim) await remote(run, worker, "resume", c.claim); else await docker(["start", c.name]);
     log("job:resumed", { repo: c.repo, issue: c.issue, worker: worker.id }); return;
   }
+  // Finalization marker keyed by claim owner: once the outcome (finish or quota requeue) is decided, a retry after a lost
+  // cleanup ACK only repeats the idempotent cleanup (no second result, metric or checkpoint).
+  const marker = c.claim ? claimPath(cfg.dataDir, c.repo, c.issue).replace(/\.json$/, ".finalized") : "";
+  const cleanup = async (claim: Claim) => {
+    await remote(run, claim.worker, "cleanup", claim);
+    releaseClaim(cfg.dataDir, claim);
+    rmSync(marker, { force: true });
+  };
+  if (c.claim && existsSync(marker) && readFileSync(marker, "utf8") === c.claim.owner) return cleanup(c.claim);
   if (c.claim) {
     const files = await remote(run, c.claim.worker, "collect", c.claim);
     for (const [name, content] of Object.entries(files)) {
@@ -533,7 +549,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       return;
     }
     setState(cfg, c.repo, c.issue, { quotaRetry: c.phase });
-    if (c.claim) { await remote(run, worker, "cleanup", c.claim); releaseClaim(cfg.dataDir, c.claim); }
+    if (c.claim) { writeFileSync(marker, c.claim.owner); await cleanup(c.claim); }
     else await docker(["rm", c.name]);
     log("job:quota-requeued", { repo: c.repo, issue: c.issue, account, until: reset });
     await comment(c.repo, c.issue, `quota:${c.phase}`, `Kontingent von ${account} erreicht. Der unveränderte/gepushte Arbeitsplatz ist gesichert; die Factory setzt den Auftrag mit einem verfügbaren Konto fort.`);
@@ -582,8 +598,8 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       `_Schreib einen Kommentar mit einem Hinweis, dann versucht die Factory es erneut._`);
   }
   if (c.claim) {
-    await remote(run, c.claim.worker, "cleanup", c.claim);
-    releaseClaim(cfg.dataDir, c.claim);
+    writeFileSync(marker, c.claim.owner);
+    await cleanup(c.claim);
   } else await docker(["rm", "-f", c.name]).catch(() => {});
 }
 
@@ -738,6 +754,10 @@ async function maybeImprove(cfg: Config, freeSlots: number) {
   const days = cfg.improve?.everyDays;
   const due = !!days && (!existsSync(lastRun) || Date.now() - statSync(lastRun).mtimeMs > days * 86400000);
   if (!existsSync(requested) && !due) return;
+  if (cfg.workers) { // the improvement container runs on the local Docker host: respect its hostSlots, keep the request until free
+    const current = await listContainers(cfg);
+    if (cfg.workers.some(l => !l.ssh && onHostCount(cfg, current, l.host, false) >= l.hostSlots)) return;
+  }
   rmSync(requested, { force: true });
   if (!cfg.factoryRepo) { log("improve:error", { error: "factoryRepo fehlt in der Config" }); return; }
   writeFileSync(lastRun, new Date().toISOString());
@@ -785,6 +805,8 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
       if (c.unreachable) continue;
       const stopped = await remote(run, c.claim.worker, "stop", c.claim);
       await finish(cfg, { ...c, ...stopped }, "Label entfernt oder Issue geschlossen");
+      // A quota-paused claim is retained by finish(): its slot stays occupied until the claim is really released.
+      if (claims(cfg.dataDir).some(k => k.repo === c.repo && k.issue === c.issue)) continue;
     } else {
       await docker(["kill", c.name]).catch(() => {});
       await docker(["rm", "-f", c.name]).catch(() => {});
@@ -937,6 +959,6 @@ async function main() {
   }
 }
 
-export { finish, tick, tickRepo, selectWorker, listContainers }; // für Tests
+export { finish, tick, tickRepo, selectWorker, listContainers, maybeImprove }; // für Tests
 
 if ((import.meta as any).main) main();
