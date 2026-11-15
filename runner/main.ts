@@ -497,6 +497,8 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   // Finalization marker keyed by claim owner: once the outcome (finish or quota requeue) is decided, a retry after a lost
   // cleanup ACK only repeats the idempotent cleanup (no second result, metric or checkpoint).
   const marker = c.claim ? claimPath(cfg.dataDir, c.repo, c.issue).replace(/\.json$/, ".finalized") : "";
+  // Fresh 0600 file, never through an existing path or symlink (the claim directory is runner-only, 0700).
+  const mark = (owner: string) => { rmSync(marker, { force: true }); writeFileSync(marker, owner, { flag: "wx", mode: 0o600 }); };
   const cleanup = async (claim: Claim) => {
     await remote(run, claim.worker, "cleanup", claim);
     releaseClaim(cfg.dataDir, claim);
@@ -549,7 +551,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       return;
     }
     setState(cfg, c.repo, c.issue, { quotaRetry: c.phase });
-    if (c.claim) { writeFileSync(marker, c.claim.owner); await cleanup(c.claim); }
+    if (c.claim) { mark(c.claim.owner); await cleanup(c.claim); }
     else await docker(["rm", c.name]);
     log("job:quota-requeued", { repo: c.repo, issue: c.issue, account, until: reset });
     await comment(c.repo, c.issue, `quota:${c.phase}`, `Kontingent von ${account} erreicht. Der unveränderte/gepushte Arbeitsplatz ist gesichert; die Factory setzt den Auftrag mit einem verfügbaren Konto fort.`);
@@ -598,7 +600,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       `_Schreib einen Kommentar mit einem Hinweis, dann versucht die Factory es erneut._`);
   }
   if (c.claim) {
-    writeFileSync(marker, c.claim.owner);
+    mark(c.claim.owner);
     await cleanup(c.claim);
   } else await docker(["rm", "-f", c.name]).catch(() => {});
 }
@@ -758,9 +760,7 @@ async function maybeImprove(cfg: Config, freeSlots: number) {
     const current = await listContainers(cfg);
     if (cfg.workers.some(l => !l.ssh && onHostCount(cfg, current, l.host, false) >= l.hostSlots)) return;
   }
-  rmSync(requested, { force: true });
-  if (!cfg.factoryRepo) { log("improve:error", { error: "factoryRepo fehlt in der Config" }); return; }
-  writeFileSync(lastRun, new Date().toISOString());
+  if (!cfg.factoryRepo) { rmSync(requested, { force: true }); log("improve:error", { error: "factoryRepo fehlt in der Config" }); return; }
 
   const work = join(cfg.dataDir, "improve-work");
   const runs = join(cfg.dataDir, "runs");
@@ -775,6 +775,9 @@ async function maybeImprove(cfg: Config, freeSlots: number) {
     "-e", `REPO=${cfg.factoryRepo}`, "-e", `MODEL=${cfg.model}`, "-e", "GH_TOKEN", "-e", authVar,
     "-v", `${work}:/work`, "-v", `${runs}:/data/runs:ro`, "-v", `${metrics}:/data/metrics.jsonl:ro`,
     "--entrypoint", "/factory/improve.sh", cfg.image], { GH_TOKEN: ghToken });
+  // Request and schedule are consumed only after the container start is confirmed; any failure above keeps the request.
+  rmSync(requested, { force: true });
+  writeFileSync(lastRun, new Date().toISOString());
   log("improve:started", { repo: cfg.factoryRepo });
 }
 

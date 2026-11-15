@@ -389,3 +389,35 @@ test('Abbruch eines quota-pausierten Claims gibt den Slot erst mit dem echten Re
  assert.equal(claims(config.dataDir).length,1,'Claim bleibt (pausiert)');
  assert.equal(slots.free,0,'Slot bleibt belegt');
 });
+
+// ---------- Improvement-Anforderung nur nach bestaetigtem Start entfernen; Marker-Datei gehaertet ----------
+
+const improveCfg=()=>{const config=cfg({maxParallel:2,factoryRepo:'a/factory'});writeFileSync(join(config.dataDir,'improve-requested'),'');return config;};
+test('Improvement-Start schlaegt fehl: Anforderung bleibt erhalten',async()=>{
+ const config=improveCfg();
+ scripted=async(cmd)=>cmd[0]==='docker'&&cmd[1]==='run'?{out:'',code:1}:{out:'tok\n'};
+ try{await maybeImprove(config,1).catch(()=>{});}finally{scripted=undefined;}
+ assert.ok(existsSync(join(config.dataDir,'improve-requested')),'Anforderung bleibt');
+ assert.ok(!existsSync(join(config.dataDir,'improve-last')),'Zeitstempel erst nach Start');
+});
+// chown auf die Container-UID braucht root bzw. passende UID; sonst ist der Erfolgsfall hier nicht ausfuehrbar.
+test('Improvement-Start ok: Anforderung wird entfernt',{skip:process.getuid?.()!==0&&process.getuid?.()!==1001},async()=>{
+ const config=improveCfg();
+ scripted=async(cmd)=>({out:'tok\n'});
+ try{await maybeImprove(config,1);}finally{scripted=undefined;}
+ assert.ok(!existsSync(join(config.dataDir,'improve-requested')));
+ assert.ok(existsSync(join(config.dataDir,'improve-last')));
+});
+test('Finalisierungsmarker: 0600 und ein vorhandener Symlink wird nicht verfolgt',async()=>{
+ const w=quotaWorker('os','main'),config=cfg({workers:[w]});
+ const claim={worker:w,repo:'a/b',issue:7,name:'sf-a-b-7',phase:'build',mode:'new',startedAt:new Date().toISOString(),owner:'nonce',image:'test'};
+ saveClaim(config.dataDir,claim);
+ const dir=join(config.dataDir,'jobs','a__b__7');mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'claude.jsonl'),quotaFiles());
+ const victim=join(tmp(),'victim');writeFileSync(victim,'unberuehrt');
+ const marker=join(config.dataDir,'worker-claims','a__b__7.finalized');symlinkSync(victim,marker);
+ scripted=async(cmd,input)=>{if(cmd[0]!=='ssh')return {out:''};const p=JSON.parse(input);
+  if(p.action==='checkpoint')return {out:JSON.stringify({clean:true,resumable:false})};return {out:p.action==='cleanup'?'ACK verloren':'{}'};};
+ try{await assert.rejects(finish(config,{...claim,claim,running:false,finishedAt:new Date().toISOString(),exitCode:1} as any));}finally{scripted=undefined;}
+ assert.equal(readFileSync(victim,'utf8'),'unberuehrt');
+ assert.equal(lstatSync(marker).isSymbolicLink(),false);assert.equal(lstatSync(marker).mode&0o777,0o600);assert.equal(readFileSync(marker,'utf8'),'nonce');
+});
