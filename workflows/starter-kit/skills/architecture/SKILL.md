@@ -23,7 +23,7 @@ If `docs/stack.md` does not exist, derive the stack from the repo (manifests, co
 5. Stay inside the stack from `docs/stack.md`. Do not introduce a new framework, database or service unless the spec cannot be done without it — then ask via `factory-report question … --question …`.
 
 ## Before Any Question
-Apply the decision filter in `/factory/playbooks/factory.md`: inspect existing decisions first. Only a missing human decision warrants `factory-report question`. Write brief plain-language background, one concrete decision, 2–3 viable choices and a recommendation with a reason. Waiting for another issue, PR or active writer is a technical dependency, not a question for the human: report its link, owner and verifiable resumption condition through the existing phase outcome. Do not invent a new status or promise automatic resumption.
+Apply the decision filter in `/factory/playbook.md`: inspect existing decisions first. Only a missing human decision warrants `factory-report question`. Write brief plain-language background, one concrete decision, 2–3 viable choices and a recommendation with a reason. Waiting for another issue, PR or active writer is a technical dependency, not a question for the human: report its link, owner and verifiable resumption condition through the existing phase outcome. Do not invent a new status or promise automatic resumption.
 
 ## Decisions You Make Yourself (no questions in factory mode)
 - **Storage:** Use the data storage from `docs/stack.md`. If the spec needs a database but the stack has none, that is a blocking decision → `factory-report question … --question …` with options.
