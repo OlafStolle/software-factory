@@ -264,7 +264,11 @@ test('actual checkpoint distinguishes pushed, dirty and unpublished work; only o
   git('init','-b','factory/1');git('config','user.name','test');git('config','user.email','test@example.org');
   writeFileSync(join(repo,'file'),'base');git('add','.');git('commit','-m','base');git('update-ref','refs/remotes/origin/main','HEAD');
   assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:true,resumable:true});
-  writeFileSync(join(repo,'file'),'dirty');
+  writeFileSync(join(repo,'.git','info','exclude'),'ignored\n');writeFileSync(join(repo,'ignored'),'local work');
+  assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:true});rmSync(join(repo,'ignored'));
+  writeFileSync(join(repo,'file'),'dirty');writeFileSync(join(repo,'untracked'),'unpublished');git('stash','push','-u');
+  assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:true});
+  git('stash','pop');
   assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:true});
   git('add','.');git('commit','-m','unpublished');
   assert.deepEqual(await remote(f.exec,f.w,'checkpoint',f.payload),{clean:false,resumable:true});

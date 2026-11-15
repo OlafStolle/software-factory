@@ -522,7 +522,7 @@ async function finish(cfg: Config, c: Container, reason?: string) {
       const image = (await docker(["inspect", c.name, "--format", "{{.Image}}"])).trim();
       if (!existsSync(join(dir, "repo"))) checkpoint = { clean: true, resumable: false };
       else {
-        const script = 'cd /work/repo || exit 2; test -d .git || exit 2; test "$(git branch --show-current)" = "$1" || exit 2; dirty=$(git status --porcelain --untracked-files=all) || exit 2; ahead=$(git log --branches --not --remotes --format=%H) || exit 2; if test -z "$dirty" && test -z "$ahead"; then printf clean; else printf dirty; fi';
+        const script = 'cd /work/repo || exit 2; test -d .git || exit 2; test "$(git branch --show-current)" = "$1" || exit 2; dirty=$(git status --porcelain --untracked-files=all --ignored=matching) || exit 2; ahead=$(git log --branches --not --remotes --format=%H) || exit 2; stash=$(git for-each-ref --format="%(refname)" refs/stash) || exit 2; if test -z "$dirty" && test -z "$ahead" && test -z "$stash"; then printf clean; else printf dirty; fi';
         try { const safe = (await docker(["inspect", c.name, "--format", '{{index .Config.Labels "sf.resume-safe"}}'])).trim() === "1"; const proof = (await docker(["run", "--rm", "--network", "none", "--entrypoint", "sh", "-v", `${dir}:/work:ro`, image, "-c", script, "sh", `factory/${c.issue}`])).trim(); checkpoint = { clean: proof === "clean", resumable: safe && ["clean", "dirty"].includes(proof) }; } catch {}
       }
     }

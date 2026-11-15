@@ -45,3 +45,12 @@ test('actual entrypoint preserves unpublished build commit and dirty file on sam
   assert.equal(git('rev-parse','HEAD'),head);assert.equal(readFileSync(join(repo,'file'),'utf8'),'dirty');
  }finally{rmSync(d,{recursive:true,force:true});}
 });
+
+test('malformed cooldown values fail closed instead of silently making an account available',()=>{
+ const d=mkdtempSync(join(tmpdir(),'sf-bad-cooldown-'));try{
+  for(const value of ['{','null','[]','{"main":"bad"}','{"main":-1}']){
+   writeFileSync(join(d,'account-cooldowns.json'),value);
+   assert.throws(()=>accountUntil(d,'main'));assert.throws(()=>coolAccount(d,'main',Date.now()+1000));
+  }
+ }finally{rmSync(d,{recursive:true,force:true});}
+});

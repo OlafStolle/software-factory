@@ -280,7 +280,7 @@ elif p['action']=='inspect':
 elif p['action']=='checkpoint':
     owned(); state=info()
     if state['running'] or completed(): raise RuntimeError('checkpoint requires stopped owned job')
-    script='cd /work/repo || exit 2; test -d .git || exit 2; test "$(git branch --show-current)" = "$1" || exit 2; dirty=$(git status --porcelain --untracked-files=all) || exit 2; ahead=$(git log --branches --not --remotes --format=%H) || exit 2; if test -z "$dirty" && test -z "$ahead"; then printf clean; else printf dirty; fi'
+    script='cd /work/repo || exit 2; test -d .git || exit 2; test "$(git branch --show-current)" = "$1" || exit 2; dirty=$(git status --porcelain --untracked-files=all --ignored=matching) || exit 2; ahead=$(git log --branches --not --remotes --format=%H) || exit 2; stash=$(git for-each-ref --format="%(refname)" refs/stash) || exit 2; if test -z "$dirty" && test -z "$ahead" && test -z "$stash"; then printf clean; else printf dirty; fi'
     if not (job/'work'/'repo').exists(): print(json.dumps({'clean':True,'resumable':False}))
     else:
         try:
