@@ -749,7 +749,7 @@ async function improveRunning(cfg: Config): Promise<boolean> {
   return running;
 }
 
-async function maybeImprove(cfg: Config, freeSlots: number) {
+async function maybeImprove(cfg: Config, freeSlots: number, deps: { chown?: (path: string) => void } = {}) {
   if (freeSlots <= 0) return;
   const requested = join(cfg.dataDir, "improve-requested");
   const lastRun = join(cfg.dataDir, "improve-last");
@@ -760,14 +760,17 @@ async function maybeImprove(cfg: Config, freeSlots: number) {
     const current = await listContainers(cfg);
     if (cfg.workers.some(l => !l.ssh && onHostCount(cfg, current, l.host, false) >= l.hostSlots)) return;
   }
-  if (!cfg.factoryRepo) { rmSync(requested, { force: true }); log("improve:error", { error: "factoryRepo fehlt in der Config" }); return; }
+  if (!cfg.factoryRepo) { // misconfiguration: drop the request and advance the schedule so the error is logged at most once per interval
+    rmSync(requested, { force: true }); writeFileSync(lastRun, new Date().toISOString());
+    log("improve:error", { error: "factoryRepo fehlt in der Config" }); return;
+  }
 
   const work = join(cfg.dataDir, "improve-work");
   const runs = join(cfg.dataDir, "runs");
   const metrics = join(cfg.dataDir, "metrics.jsonl");
   mkdirSync(work, { recursive: true }); mkdirSync(runs, { recursive: true });
   if (!existsSync(metrics)) writeFileSync(metrics, "");
-  chownSync(work, CONTAINER_UID, CONTAINER_UID);
+  (deps.chown ?? ((p: string) => chownSync(p, CONTAINER_UID, CONTAINER_UID)))(work); // injectable for tests running without root
   const ghToken = (await gh(["auth", "token"])).trim();
   const authVar = process.env.CLAUDE_CODE_OAUTH_TOKEN ? "CLAUDE_CODE_OAUTH_TOKEN" : "ANTHROPIC_API_KEY";
   await docker(["run", "-d", "--name", "sf-improve", "--label", "sf.improve=1",

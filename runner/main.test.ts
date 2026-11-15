@@ -393,19 +393,28 @@ test('Abbruch eines quota-pausierten Claims gibt den Slot erst mit dem echten Re
 // ---------- Improvement-Anforderung nur nach bestaetigtem Start entfernen; Marker-Datei gehaertet ----------
 
 const improveCfg=()=>{const config=cfg({maxParallel:2,factoryRepo:'a/factory'});writeFileSync(join(config.dataDir,'improve-requested'),'');return config;};
-test('Improvement-Start schlaegt fehl: Anforderung bleibt erhalten',async()=>{
- const config=improveCfg();
- scripted=async(cmd)=>cmd[0]==='docker'&&cmd[1]==='run'?{out:'',code:1}:{out:'tok\n'};
- try{await maybeImprove(config,1).catch(()=>{});}finally{scripted=undefined;}
+const noChown={chown:()=>{}};
+test('Improvement-Start schlaegt fehl: Docker wurde erreicht, Anforderung bleibt erhalten',async()=>{
+ const config=improveCfg();const seen:string[]=[];
+ scripted=async(cmd)=>{seen.push(cmd.slice(0,2).join(' '));return cmd[0]==='docker'&&cmd[1]==='run'?{out:'',code:1}:{out:'tok\n'};};
+ try{await assert.rejects(maybeImprove(config,1,noChown));}finally{scripted=undefined;}
+ assert.ok(seen.includes('docker run'),'docker run wurde nachweislich aufgerufen');
  assert.ok(existsSync(join(config.dataDir,'improve-requested')),'Anforderung bleibt');
  assert.ok(!existsSync(join(config.dataDir,'improve-last')),'Zeitstempel erst nach Start');
 });
-// chown auf die Container-UID braucht root bzw. passende UID; sonst ist der Erfolgsfall hier nicht ausfuehrbar.
-test('Improvement-Start ok: Anforderung wird entfernt',{skip:process.getuid?.()!==0&&process.getuid?.()!==1001},async()=>{
- const config=improveCfg();
- scripted=async(cmd)=>({out:'tok\n'});
- try{await maybeImprove(config,1);}finally{scripted=undefined;}
+test('Improvement-Start ok: Anforderung wird entfernt, improve-last geschrieben',async()=>{
+ const config=improveCfg();const seen:string[]=[];
+ scripted=async(cmd)=>{seen.push(cmd.slice(0,2).join(' '));return {out:'tok\n'};};
+ try{await maybeImprove(config,1,noChown);}finally{scripted=undefined;}
+ assert.ok(seen.includes('docker run'));
  assert.ok(!existsSync(join(config.dataDir,'improve-requested')));
+ assert.ok(existsSync(join(config.dataDir,'improve-last')));
+});
+test('Improvement ohne factoryRepo: Fehlerlog hoechstens einmal je Intervall',async()=>{
+ const config=cfg({maxParallel:2,improve:{everyDays:7}});const lines:string[]=[];const orig=console.log;
+ console.log=(...a:unknown[])=>{lines.push(a.join(' '));};
+ try{await maybeImprove(config,1,noChown);await maybeImprove(config,1,noChown);await maybeImprove(config,1,noChown);}finally{console.log=orig;}
+ assert.equal(lines.filter(l=>l.includes('improve:error')).length,1);
  assert.ok(existsSync(join(config.dataDir,'improve-last')));
 });
 test('Finalisierungsmarker: 0600 und ein vorhandener Symlink wird nicht verfolgt',async()=>{
