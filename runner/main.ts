@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { quotaReset, accountUntil, coolAccount } from "./accounts.ts";
 import { claims, saveClaim, releaseClaim, remote, ensureImage, validateWorkers, hasCapacity, type Worker, type Claim } from "./workers.ts";
 
 export type Config = {
@@ -149,7 +150,7 @@ export function redact(text: string): string {
 
 // ---------- Dauerhafter Zustand pro Issue (nur für den Runner) ----------
 
-type IssueState = { lostRetries?: number };
+type IssueState = { lostRetries?: number; quotaRetry?: Phase; quotaPause?: { account: string; until: number; resumable: boolean } };
 const stateFile = (cfg: Config, repo: string, n: number) => join(cfg.dataDir, "state", `${repo.replace("/", "__")}__${n}.json`);
 function getState(cfg: Config, repo: string, n: number): IssueState {
   try { return JSON.parse(readFileSync(stateFile(cfg, repo, n), "utf8")); } catch { return {}; }
@@ -316,7 +317,7 @@ async function selectWorker(cfg: Config): Promise<Worker | undefined | null> {
   if (!cfg.workers) return undefined;
   const current = await listContainers(cfg);
   for (const w of cfg.workers) {
-    if (w.enabled === false) continue;
+    if (w.enabled === false || accountUntil(cfg.dataDir, w.account ?? w.id) > Date.now()) continue;
     const occupied = current.filter(c => c.claim ? c.claim.worker.id === w.id : !w.ssh).length;
     const onHost = current.filter(c => c.claim ? c.claim.worker.host === w.host : cfg.workers!.some(l => !l.ssh && l.host === w.host)).length;
     if (onHost >= w.hostSlots) continue;
@@ -467,6 +468,25 @@ async function checkBuild(repo: string, issue: number, dir: string, prUrl?: stri
 /** Wertet einen beendeten Container aus und räumt ihn weg. `reason` = Grund, warum der Runner ihn beendet hat. */
 async function finish(cfg: Config, c: Container, reason?: string) {
   const dir = jobDir(cfg, c.repo, c.issue);
+  const paused = getState(cfg, c.repo, c.issue).quotaPause;
+  if (paused) {
+    if (!paused.resumable || accountUntil(cfg.dataDir, paused.account) > Date.now()) return;
+    const worker = c.claim ? cfg.workers?.find(w => w.id === c.claim!.worker.id) : cfg.workers?.find(w => !w.ssh);
+    if (!worker || worker.enabled === false) return;
+    const issue = JSON.parse(await gh(["issue", "view", String(c.issue), "-R", c.repo, "--json", "state,labels"]));
+    if (issue.state !== "OPEN" || !issue.labels.some((l: any) => l.name === cfg.label)) return;
+    const available = worker.ssh ? await remote(run, worker, "capacity") : { memoryMiB: Number(readFileSync("/proc/meminfo", "utf8").match(/MemAvailable:\s+(\d+)/)?.[1] ?? 0) / 1024, diskMiB: Number(statfsSync(cfg.dataDir).bavail) * Number(statfsSync(cfg.dataDir).bsize) / 1048576 };
+    if (!worker.ssh) {
+      const dockerRoot = (await docker(["info", "--format", "{{.DockerRootDir}}"])).trim();
+      const fs = statfsSync(dockerRoot);
+      available.dockerDiskMiB = Number(fs.bavail) * Number(fs.bsize) / 1048576;
+    }
+    if (!hasCapacity(worker, available, 0)) return;
+    // Clear before starting: an ambiguous reply retains the container/claim, never creates another writer.
+    setState(cfg, c.repo, c.issue, {});
+    if (c.claim) await remote(run, worker, "resume", c.claim); else await docker(["start", c.name]);
+    log("job:resumed", { repo: c.repo, issue: c.issue, worker: worker.id }); return;
+  }
   if (c.claim) {
     const files = await remote(run, c.claim.worker, "collect", c.claim);
     for (const [name, content] of Object.entries(files)) {
@@ -491,6 +511,34 @@ async function finish(cfg: Config, c: Container, reason?: string) {
   if (!problem && !(status.status && endStates[c.phase].includes(status.status))) problem = "Der Lauf hat kein Ergebnis gemeldet.";
   if (!problem && (c.exitCode !== 0 || result.is_error)) problem = `Claude Code wurde mit einem Fehler beendet (Exit-Code ${c.exitCode}).`;
   if (!problem && c.phase === "build" && status.status === "accepting") problem = await checkBuild(c.repo, c.issue, dir, status.pr);
+  const worker = c.claim?.worker ?? cfg.workers?.find(w => !w.ssh);
+  const reset = !reason && problem && worker ? quotaReset(tail) : null;
+  if (reset && worker) {
+    const account = worker.account ?? worker.id;
+    coolAccount(cfg.dataDir, account, reset);
+    let checkpoint = { clean: false, resumable: false };
+    if (c.claim) checkpoint = await remote(run, worker, "checkpoint", c.claim);
+    else {
+      const image = (await docker(["inspect", c.name, "--format", "{{.Image}}"])).trim();
+      if (!existsSync(join(dir, "repo"))) checkpoint = { clean: true, resumable: false };
+      else {
+        const script = 'cd /work/repo || exit 2; test -d .git || exit 2; test "$(git branch --show-current)" = "$1" || exit 2; dirty=$(git status --porcelain --untracked-files=all --ignored=matching) || exit 2; ahead=$(git log --branches --not --remotes --format=%H) || exit 2; stash=$(git for-each-ref --format="%(refname)" refs/stash) || exit 2; if test -z "$dirty" && test -z "$ahead" && test -z "$stash"; then printf clean; else printf dirty; fi';
+        try { const safe = (await docker(["inspect", c.name, "--format", '{{index .Config.Labels "sf.resume-safe"}}'])).trim() === "1"; const proof = (await docker(["run", "--rm", "--network", "none", "--entrypoint", "sh", "-v", `${dir}:/work:ro`, image, "-c", script, "sh", `factory/${c.issue}`])).trim(); checkpoint = { clean: proof === "clean", resumable: safe && ["clean", "dirty"].includes(proof) }; } catch {}
+      }
+    }
+    if (!checkpoint.clean) {
+      setState(cfg, c.repo, c.issue, { quotaPause: { account, until: reset, resumable: checkpoint.resumable && c.phase === "build" } });
+      log("job:quota-paused", { repo: c.repo, issue: c.issue, account, until: reset });
+      await comment(c.repo, c.issue, `quota:${c.phase}`, `Kontingent von ${account} erreicht. Arbeitsplatz und Claim bleiben erhalten; Wiederaufnahme frühestens ${new Date(reset).toISOString()}.`);
+      return;
+    }
+    setState(cfg, c.repo, c.issue, { quotaRetry: c.phase });
+    if (c.claim) { await remote(run, worker, "cleanup", c.claim); releaseClaim(cfg.dataDir, c.claim); }
+    else await docker(["rm", c.name]);
+    log("job:quota-requeued", { repo: c.repo, issue: c.issue, account, until: reset });
+    await comment(c.repo, c.issue, `quota:${c.phase}`, `Kontingent von ${account} erreicht. Der unveränderte/gepushte Arbeitsplatz ist gesichert; die Factory setzt den Auftrag mit einem verfügbaren Konto fort.`);
+    return;
+  }
   const ended = !problem;
   const metricStatus = ended ? (status.status === "review" && status.unresolved ? "unresolved" : status.status) : "failed";
 
@@ -765,6 +813,7 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
   }
 
   for (const issue of issues) {
+    try {
     const status = stageOf(issue);
     const running = containers.find((c) => c.repo === repo && c.issue === issue.number && openNumbers.has(c.issue));
     if (running) {
@@ -802,6 +851,8 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
       prUrl = (await findPr(repo, issue.number, "open"))?.url;
       if (prUrl) { phase = "build"; mode = "change-request"; }
     }
+    const quotaRetry = getState(cfg, repo, issue.number).quotaRetry;
+    if (quotaRetry) { phase = quotaRetry; mode = "retry"; }
     if (!phase) continue;
     // Ein gemeinsamer Platz-Pool für alle Phasen. Ohne freien Platz bleibt das Issue in seinem Status und kommt beim nächsten Durchlauf dran.
     if (slots.free <= 0) continue;
@@ -816,6 +867,8 @@ async function tickRepo(cfg: Config, repo: string, containers: Container[], slot
       if (!await launch(cfg, repo, issue, phase, mode, prUrl)) continue;
     }
     slots.free--;
+    if (quotaRetry) setState(cfg, repo, issue.number, {});
+    } catch { log("issue:blocked", { repo, issue: issue.number }); }
   }
 
   await syncPreviews(cfg, repo, issues).catch((e) => log("preview:error", { repo, error: String(e) }));
@@ -841,7 +894,7 @@ async function tick(cfg: Config) {
       log("finish:error", { repo: c.repo, issue: c.issue, error: String(e) });
     }
   }
-  containers = (await listContainers(cfg)).filter((c) => c.running || c.claim);
+  containers = (await listContainers(cfg)).filter((c) => c.running || c.claim || getState(cfg, c.repo, c.issue).quotaPause);
   const improving = await improveRunning(cfg);
   const slots = { free: cfg.maxParallel - containers.length - (improving ? 1 : 0) };
 
@@ -884,6 +937,6 @@ async function main() {
   }
 }
 
-export { finish, tick, listContainers }; // für Tests
+export { finish, tick, tickRepo, selectWorker, listContainers }; // für Tests
 
 if ((import.meta as any).main) main();

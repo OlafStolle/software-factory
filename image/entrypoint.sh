@@ -32,7 +32,10 @@ fi
 cd repo
 git fetch --quiet origin
 DEFAULT_BRANCH=$(gh repo view "$REPO" --json defaultBranchRef --jq .defaultBranchRef.name)
-if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+if [ "$PHASE" = "build" ] && [ "$(git branch --show-current)" = "$BRANCH" ]; then
+  # A quota pause restarts this same container. Preserve uncommitted and unpushed work.
+  log "Vorhandenen Bau-Branch unverändert fortsetzen: $BRANCH"
+elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
   git checkout --quiet -B "$BRANCH" "origin/$BRANCH"
   # Die Abnahme startet immer mit genau dem gepushten Stand, ohne Reste früherer Läufe
   if [ "$PHASE" = "accept" ]; then git reset --quiet --hard "origin/$BRANCH" && git clean -ffdxq; fi

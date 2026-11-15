@@ -1,6 +1,7 @@
 # Job-Image: Jeder Factory-Job läuft in einem eigenen Container aus diesem Image.
 # Enthält Claude Code, GitHub CLI, git, Node und einen Chromium für Screenshots/E2E-Tests.
 FROM mcr.microsoft.com/playwright:v1.65.0-noble
+LABEL sf.resume-safe="1"
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq \
