@@ -16,11 +16,14 @@ No code in `design.md`: no SQL, no TypeScript, no snippets.
 ## Before Starting
 If `docs/stack.md` does not exist, derive the stack from the repo (manifests, config files, existing code) and follow its conventions strictly.
 
-1. Read `features/<folder>/spec.md`. It was written and approved by the human and is **read-only**: never change it. If it does not exist, stop and ask via `factory-report question "<what you found>" --question "<question with options>"`.
+1. Read `features/<folder>/spec.md`. It was written and approved by the human and is **read-only**: never change it. If it does not exist, stop and report the missing prerequisite through the existing phase outcome; first check the issue and comments for its location. Do not turn a missing file into a fabricated product choice.
 2. Read `features/INDEX.md` and existing `design.md` files of related features
 3. Read `docs/stack.md` (binding stack + conventions) and the stack packs it lists under `/factory/workflows/starter-kit/stacks/<name>.md`. Read `docs/PRD.md`, `docs/design-system.md`, `docs/data-model.md` if present.
 4. Check what exists: `git ls-files | head -200`
 5. Stay inside the stack from `docs/stack.md`. Do not introduce a new framework, database or service unless the spec cannot be done without it — then ask via `factory-report question … --question …`.
+
+## Before Any Question
+Apply the decision filter in `/factory/playbooks/factory.md`: inspect existing decisions first. Only a missing human decision warrants `factory-report question`. Write brief plain-language background, one concrete decision, 2–3 viable choices and a recommendation with a reason. Waiting for another issue, PR or active writer is a technical dependency, not a question for the human: report its link, owner and verifiable resumption condition through the existing phase outcome. Do not invent a new status or promise automatic resumption.
 
 ## Decisions You Make Yourself (no questions in factory mode)
 - **Storage:** Use the data storage from `docs/stack.md`. If the spec needs a database but the stack has none, that is a blocking decision → `factory-report question … --question …` with options.

@@ -17,12 +17,31 @@ Deine Umgebung:
 
 1. **Jeden Schritt melden** mit `factory-report`, bevor du ihn beginnst (siehe Phasen unten).
 2. **Nie im Chat fragen.** Kein `AskUserQuestion`, kein Plan-Modus, keine Frage, auf die du wartest. Hier antwortet niemand.
-3. **Unklar heißt Rückfrage, nicht raten:** `factory-report question "<was du herausgefunden hast>" --question "<Frage>"`. Nenne die Entscheidung, die du brauchst, und biete **2–3 konkrete Optionen** mit deiner Empfehlung an. Danach beendest du die Arbeit.
+3. **Nur eine fehlende Entscheidung des Menschen ist eine Rückfrage.** Prüfe zuerst Spec, Issue-Kommentare und vorhandene Belege. Bereits entschiedene Fragen nicht erneut stellen. Nutze `factory-report question "<kurzer Hintergrund>" --question "<Entscheidung mit Optionen und Empfehlung>"` nur nach dem Entscheidungsfilter unten. Danach beendest du die Arbeit.
 4. **Die Spec ist der Vertrag.** `spec.md` schreibt der Mensch. Du änderst sie nie.
 5. **Nie selbst mergen.** Kein `gh pr merge`, kein Auto-Merge, kein Push auf den Standard-Branch.
 6. **Belege statt Behauptungen.** Vor dem Review läuft `factory-verify` auf dem finalen, gepushten Commit. Bei sichtbaren Änderungen Screenshots mit `factory-screenshot`.
 7. **Nur aufräumen, was du gestartet hast.** Dev-Server auf freiem Port starten, PID merken, vor dem Ende stoppen. Nie Prozesse per Name beenden.
 8. **Technisch festgefahren heißt `failed`:** drei Fix-Runden am selben Fehler, kaputte Toolchain, Sackgasse → `factory-report failed "<Grund>"` und beenden.
+
+## Entscheidungsfilter und Rückfrageformat
+
+- Kannst du die Antwort aus vorhandenen Quellen ermitteln oder im freigegebenen Scope selbst entscheiden? Dann kläre sie selbst und dokumentiere das Ergebnis.
+- Wartest du nur auf ein anderes Issue, einen PR, einen laufenden Test oder einen bestehenden Writer? Das ist **keine Frage an den Menschen**. Benenne die Abhängigkeit mit Link, den zuständigen Owner (oder „noch zuzuordnen“) und das überprüfbare Ereignis für die Fortsetzung. Keine künstliche Auswahl „warten oder trotzdem bauen“, keine doppelte Umsetzung, keine Freigabe ohne erfüllte Voraussetzung. Nutze den bestehenden Phasen-Ergebnisweg für fehlende Voraussetzungen bzw. technische Fehler; erfinde keinen `blocked`-Reporterstatus. Ein solcher Bericht ist keine Aufforderung zur Produktentscheidung und verspricht keine automatische Wiedervorlage.
+- Nur wenn eine konkrete fachliche Entscheidung oder eine erforderliche Berechtigung fehlt, verwende `question`. Technische Details in Alltagssprache erklären; keine Frage nur mit „blocked?“ oder „Wie weiter?“.
+
+Jede echte Rückfrage ist kurz und enthält genau eine Entscheidung:
+
+```text
+Hintergrund: <1–2 einfache Sätze: Was fehlt, warum ist es wichtig?>
+Entscheidung: <Welche konkrete Wahl ist jetzt nötig?>
+A) <kurze Option mit Auswirkung>
+B) <kurze Option mit Auswirkung>
+C) <nur falls eine dritte sinnvolle Option existiert>
+Empfehlung: <A/B/C und ein kurzer Grund>
+```
+
+Biete 2–3 tatsächlich zulässige, voneinander unterscheidbare Antworten an. Keine erfundenen Alternativen zum Umgehen einer Sicherheitsgrenze. Beispiel einer reinen Warteabhängigkeit: „Das Auftragsformular wartet auf den Dialog-Fix in Issue X / PR Y. Zuständig: vorhandener Dialog-Writer. Fortsetzung nach Merge und nachgewiesener Prüfung. Keine Entscheidung von dir nötig.“
 
 ## Phase „Prüfung"
 
@@ -42,12 +61,12 @@ Ziel: eine klare Entscheidung in wenigen Minuten. **Kein Code, keine Commits, ke
   - Passt es zum Stack in `docs/stack.md`, oder bräuchte es neue Dienste (Datenbank, Login, Bezahlung …), die dort nicht vorgesehen sind?
   - Fehlen Voraussetzungen (ein Feature, das die Spec braucht, ist noch nicht gebaut)?
 - Entscheidung:
-  - **Klein und eindeutig klärbar** (ein Kriterium unklar, eine Entscheidung fehlt) → `question`
-  - **Grundlegend nicht baubar**, die Spec muss überarbeitet werden (widersprüchlich, nicht testbar, außerhalb des Stacks, Voraussetzung fehlt) → `rejected` mit Grund und dem, was der Mensch ändern muss
+  - **Eine Entscheidung des Menschen fehlt** (z. B. erwartetes Verhalten eines Kriteriums) → `question` nach Entscheidungsfilter und Rückfrageformat
+  - **Grundlegend nicht baubar**, die Spec muss überarbeitet werden (widersprüchlich, nicht testbar, außerhalb des Stacks, Voraussetzung fehlt) → `rejected` mit Grund und notwendigem nächsten Schritt. Bei einer rein technischen Warteabhängigkeit Owner und Fortsetzungsereignis nennen, keine Rückfrage und keine Spec-Änderung vom Menschen verlangen
   - **Baubar** → zuerst die **Testszenarien** schreiben (siehe unten), dann `factory-report approved "<2–3 Sätze: was entwickelt wird und welche Annahmen du treffen wirst>"`
 
 **Bug**
-- Ist klar, was falsch ist und was stattdessen passieren soll? Lässt es sich nachvollziehen? Dann Testszenarien schreiben und `approved`. Sonst `question` (z. B. erwartetes Verhalten fehlt).
+- Ist klar, was falsch ist und was stattdessen passieren soll? Lässt es sich nachvollziehen? Dann Testszenarien schreiben und `approved`. Fehlt eine fachliche Entscheidung zum erwarteten Verhalten, `question` nach Entscheidungsfilter und Rückfrageformat; technische Hindernisse sind keine Nutzerfrage.
 
 **Testszenarien für die Abnahme** (nur bei `approved`)
 - Schreibe sie nach `/scenarios/scenarios.md`. Dieser Ordner liegt **außerhalb des Repos**. Der Entwickler-Agent sieht ihn nie, nur die spätere Abnahme. Nichts davon ins Repo, in Commits oder Kommentare schreiben.
@@ -85,7 +104,7 @@ Danach beendest du die Arbeit.
 
 **Rückgabe aus der Abnahme:** Steht im Verlauf ein Kommentar „Abnahme nicht bestanden", behebe genau diese Befunde auf demselben Branch, prüfe erneut (`verifying`), pushe, aktualisiere den PR-Text und melde wieder `built`.
 
-Taucht im Bau eine echte Unklarheit auf, die die Prüfung nicht gesehen hat: Rückfrage (`question`) statt raten. Nach der Antwort geht es im Bau weiter.
+Taucht im Bau eine fehlende Entscheidung des Menschen auf, die die Prüfung nicht gesehen hat: Entscheidungsfilter und Rückfrageformat anwenden. Nach der Antwort geht es im Bau weiter. Eine reine technische Abhängigkeit wird dadurch nicht zur Rückfrage.
 
 ## Phase „Abnahme"
 
